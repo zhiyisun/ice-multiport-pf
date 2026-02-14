@@ -34,7 +34,43 @@ This document presents a detailed architectural design for the E810 Ice Driver, 
 
 **Important Disclaimer:** This document outlines the architectural design for a **custom FPGA-based implementation** of the E810 NIC. This design incorporates the necessary hardware and firmware modifications to support the multi-port PF features described herein. As detailed in the following section, this model is **not feasible** on standard E810 hardware.
 
-## 2. Background: Feasibility on Standard E810 Hardware
+## 2. Kernel Compatibility - No Core Kernel Modifications
+
+**CRITICAL DESIGN PRINCIPLE:** This implementation uses **standard Linux kernel frameworks** without modifying core kernel files.
+
+### What NOT to Modify:
+```
+❌ arch/x86/include/asm/msi.h       (standard Linux MSI-X header)
+❌ drivers/pci/iov.c                 (standard Linux SR-IOV support)
+❌ drivers/pci/msi/*                 (standard interrupt subsystem)
+❌ include/linux/pci.h               (standard PCI framework)
+```
+
+### Why This Matters:
+- Modifying core kernel files impacts **ALL drivers and the entire system**
+- Changes cannot be upstreamed to Linux mainline
+- Every kernel upgrade requires rebasing custom changes
+- Maintenance burden and stability risks are unacceptable
+
+### Supported by Existing Kernel:
+The Linux kernel **already provides** everything needed:
+- ✅ Multiple `net_device` per PF (established pattern in switchdev drivers)
+- ✅ Per-VSI resource management (ICE driver already supports multiple VSIs)
+- ✅ Custom sysfs attributes (standard framework)
+- ✅ Flexible MSI-X allocation (kernel MSI subsystem)
+- ✅ Standard SR-IOV infrastructure (`pci_enable_sriov()`, `pci_disable_sriov()`)
+
+### Implementation Scope:
+All multi-port functionality is implemented within the **ICE driver layer only**:
+```
+✅ drivers/net/ethernet/intel/ice/ice_main.c     (probe, port discovery)
+✅ drivers/net/ethernet/intel/ice/ice_multiport.c (event demultiplexing)
+✅ drivers/net/ethernet/intel/ice/ice_lib.c      (per-port VSI management)
+✅ drivers/net/ethernet/intel/ice/ice_vf_lib.c   (VF to port mapping)
+✅ drivers/net/ethernet/intel/ice/ice_adminq.c   (port-aware AQ commands)
+```
+
+## 3. Background: Feasibility on Standard E810 Hardware
 
 An initial design assessment was performed to determine if a multi-port-per-PF model could be implemented on standard Intel E810 hardware. The conclusion of that assessment is that the proposed model is **not feasible** without non-standard firmware or hardware changes.
 
@@ -187,16 +223,26 @@ The `pci-ice-mp` QEMU device model provides:
 
 ## 6. Implementation Roadmap
 
-1.  **Port Discovery and Structures:** Implement the initial discovery of ports and the creation of associated data structures.
-2.  **Per-port VSI/Netdev:** Create the VSI and `net_device` for each port.
-3.  **Event Dispatch:** Implement the `lport` demultiplexing for event handling.
-4.  **VF Port Mapping:** Add support for VF-to-port mapping and resource partitioning (including MSI-X).
-5.  **Control Arbitration:** Implement the logic for arbitrating control of port-wide operations.
-6.  **Shared Resource Handling:** Manage shared resources, including AQ serialization and resets.
+**Scope:** All changes are contained within the ICE driver (`drivers/net/ethernet/intel/ice/`). No kernel core files are modified.
+
+1.  **Port Discovery and Structures:** Implement initial discovery of ports via AdminQ and create associated `ice_port_info` structures within the driver.
+2.  **Per-port VSI/Netdev:** Create the VSI and `net_device` for each port through standard ice driver APIs.
+3.  **Event Dispatch:** Implement `lport` demultiplexing in driver's interrupt handler (`ice_misc_intr_handler`).
+4.  **VF Port Mapping:** Add `vf->port_id` tracking in driver's VF management code; use standard kernel SR-IOV infrastructure.
+5.  **Control Arbitration:** Implement per-port control logic in driver's netdev operations.
+6.  **Shared Resource Handling:** Manage shared resources (AdminQ serialization, resets) within driver code only.
 
 ## 7. Conclusion
 
-The proposed architecture for a multi-port PF E810 Ice Driver offers a compelling vision for resource optimization in multi-port scenarios. It provides a clear path to clean per-port isolation, flexible VF grouping, and efficient interrupt handling. This design leverages the flexibility of the Linux kernel to create a powerful and efficient multi-port solution on custom hardware.
+The proposed architecture for a multi-port PF E810 Ice Driver offers a compelling vision for resource optimization in multi-port scenarios. It provides a clear path to clean per-port isolation, flexible VF grouping, and efficient interrupt handling.
+
+**Key Design Principle:** This solution leverages the flexibility of the Linux kernel's existing frameworks (multiple `net_device`, standard SR-IOV, flexible MSI-X) without requiring modifications to core kernel files. All customization is contained within the ICE driver layer, ensuring:
+
+- ✅ No impact on system-wide kernel functionality
+- ✅ Compatibility with any Linux distribution
+- ✅ Easy maintenance across kernel versions
+- ✅ Potential for upstream contribution of the driver enhancements
+- ✅ Isolation of multi-port logic from criticial kernel infrastructure
 
 ## 8. Implementation Status & Validation
 
