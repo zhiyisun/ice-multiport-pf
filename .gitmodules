@@ -1,0 +1,8 @@
+[submodule "build/qemu"]
+	path = build/qemu
+	url = git@github.com:zhiyisun/qemu.git
+	branch = dev/ice-multi-port
+[submodule "build/linux"]
+	path = build/linux
+	url = git@github.com:zhiyisun/linux.git
+	branch = dev/ice-multi-port
