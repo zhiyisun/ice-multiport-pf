@@ -22,6 +22,7 @@
 #   --skip-qemu-build  Skip QEMU build, use existing binary
 #   --skip-test        Skip running tests after boot
 #   --keep-vm          Keep VM running after test (for debugging)
+#   --clean            Clean all generated artifacts (logs, builds, images) and exit
 #   --help             Show this help message
 #
 # Environment Variables:
@@ -61,6 +62,7 @@ SKIP_BUILD=0
 SKIP_QEMU_BUILD=0
 SKIP_TEST=0
 KEEP_VM=0
+CLEAN_ONLY=0
 HELP=0
 
 QEMU_BIN="${ICE_MP_QEMU_BIN:-$BUILD_DIR/qemu/build/qemu-system-x86_64}"
@@ -795,6 +797,10 @@ main() {
                 KEEP_VM=1
                 shift
                 ;;
+            --clean)
+                CLEAN_ONLY=1
+                shift
+                ;;
             --help|-h)
                 show_help
                 exit 0
@@ -809,6 +815,15 @@ main() {
     
     # Check prerequisites
     check_prerequisites
+    
+    # Handle cleanup-only mode
+    if [ $CLEAN_ONLY -eq 1 ]; then
+        log_info "========== Cleanup Mode =========="
+        cleanup_old_artifacts
+        cleanup_network
+        log_success "All temporary files and network configuration cleaned up"
+        exit 0
+    fi
     
     log_info "========== ICE Multi-Port Driver Test Suite =========="
     log_info "Workspace: $WORKSPACE_ROOT"

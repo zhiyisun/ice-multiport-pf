@@ -114,6 +114,9 @@ sudo bash tools/run_ice_mp_test.sh --kernel-only
 
 # Build QEMU only (no kernel or tests)
 sudo bash tools/run_ice_mp_test.sh --qemu-only
+
+# Clean up all generated artifacts (logs, builds, images, network)
+sudo bash tools/run_ice_mp_test.sh --clean
 ```
 
 ## Environment Variables
