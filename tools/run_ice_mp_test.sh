@@ -328,6 +328,11 @@ ensure_kernel_config() {
     ./scripts/config --enable CONFIG_SERIAL_8250
     ./scripts/config --enable CONFIG_SERIAL_8250_CONSOLE
 
+    # Firmware loading: enable runtime loading, disable embedding
+    ./scripts/config --enable CONFIG_FW_LOADER
+    ./scripts/config --set-str CONFIG_EXTRA_FIRMWARE ""
+    ./scripts/config --set-str CONFIG_EXTRA_FIRMWARE_DIR ""
+
     # Resolve new dependencies
     make olddefconfig > /dev/null 2>&1
 
