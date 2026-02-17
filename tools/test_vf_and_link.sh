@@ -77,6 +77,53 @@ test_section() {
     echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 }
 
+# Verbose command execution - prints command and output when enabled
+# Usage: verbose_cmd "description" "command_string"
+# When ICE_MP_VERBOSE_OUTPUT=1, prints: CMD: <command>, OUT: <stdout>, ERR: <stderr>
+verbose_cmd() {
+    local desc="$1"
+    local cmd="$2"
+    if [ "${ICE_MP_VERBOSE_OUTPUT:-}" = "1" ]; then
+        echo "    CMD [$desc]: $cmd"
+        local stdout_tmp="/tmp/verbose_cmd_stdout_$$"
+        local stderr_tmp="/tmp/verbose_cmd_stderr_$$"
+        eval "$cmd" > "$stdout_tmp" 2> "$stderr_tmp"
+        local exit_code=$?
+        
+        if [ -s "$stdout_tmp" ]; then
+            echo "    OUT:"
+            sed 's/^/      /' "$stdout_tmp"
+        fi
+        if [ -s "$stderr_tmp" ]; then
+            echo "    ERR:"
+            sed 's/^/      /' "$stderr_tmp"
+        fi
+        rm -f "$stdout_tmp" "$stderr_tmp"
+        return $exit_code
+    else
+        eval "$cmd" >/dev/null 2>&1
+        return $?
+    fi
+}
+
+# Verbose command that captures output and returns it
+# Usage: output=$(verbose_cmd_capture "description" "command")
+verbose_cmd_capture() {
+    local desc="$1"
+    local cmd="$2"
+    if [ "${ICE_MP_VERBOSE_OUTPUT:-}" = "1" ]; then
+        echo "    CMD [$desc]: $cmd" >&2
+    fi
+    local stdout_tmp="/tmp/verbose_cmd_capture_stdout_$$"
+    eval "$cmd" > "$stdout_tmp" 2>&1
+    cat "$stdout_tmp"
+    if [ "${ICE_MP_VERBOSE_OUTPUT:-}" = "1" ]; then
+        echo "    OUT:" >&2
+        sed 's/^/      /' "$stdout_tmp" >&2
+    fi
+    rm -f "$stdout_tmp"
+}
+
 print_host_helper() {
         cat <<'EOF'
 Host-side helper snippet (run on host OS):
@@ -325,6 +372,7 @@ fi
 ################################################################################
 test_section 2 "Multi-Port Discovery"
 
+verbose_cmd "get_port_count" "get_port_count"
 PORT_COUNT=$(get_port_count)
 if [ "$PORT_COUNT" -eq 4 ]; then
     test_pass "4 logical ports discovered"
@@ -333,6 +381,7 @@ else
 fi
 
 # Count ICE ports only
+verbose_cmd "get_ice_ifaces" "get_ice_ifaces"
 NET_DEVICES=0
 for iface in $(get_ice_ifaces); do
     [ -n "$iface" ] && ((NET_DEVICES++))
@@ -343,12 +392,14 @@ else
     test_fail "4 network devices created" "Found $NET_DEVICES ICE devices instead of 4"
 fi
 
+verbose_cmd "eth0 exists" "ls -d /sys/class/net/eth0"
 if [ -d /sys/class/net/eth0 ]; then
     test_pass "Primary port eth0 exists"
 else
     test_fail "Primary port eth0 exists" "/sys/class/net/eth0 not found"
 fi
 
+verbose_cmd "eth3 exists" "ls -d /sys/class/net/eth3"
 if [ -d /sys/class/net/eth3 ]; then
     test_pass "Last port eth3 exists"
 else
@@ -440,6 +491,7 @@ fi
 test_section 5 "PF/VF Details via lspci"
 
 # Detailed PF enumeration
+verbose_cmd "lspci -d 8086: -n (PF count)" "lspci -d 8086: -n | grep -c ' 0200'"
 PF_DEVICES=$(lspci -d 8086: -n 2>/dev/null | grep -c " 0200" || echo 0 | xargs)
 if [ "$PF_DEVICES" -gt 0 ]; then
     test_pass "PF devices enumerated via lspci ($PF_DEVICES found)"
@@ -447,8 +499,10 @@ if [ "$PF_DEVICES" -gt 0 ]; then
     # Show PF vendor/device/class info
     PF_DEVICE=$(get_ice_pf_device)
     if [ -n "$PF_DEVICE" ]; then
+        verbose_cmd "lspci -s $PF_DEVICE -v" "lspci -s '$PF_DEVICE' -v | head -10"
         PF_INFO=$(lspci -s "$PF_DEVICE" -v 2>/dev/null | head -10)
     else
+        verbose_cmd "lspci -d 8086: -v (any PF)" "lspci -d 8086: -v | head -10"
         PF_INFO=$(lspci -d 8086: -v 2>/dev/null | head -10)
     fi
     test_info "PF Device Info:"
@@ -462,6 +516,7 @@ PF_DEVICE=$(get_ice_pf_device)
 if [ -n "$PF_DEVICE" ]; then
     # Check for VFs: try sysfs first (more reliable than lspci text matching)
     PF_SYSFS_DIR="$(pci_sysfs_path "$PF_DEVICE")"
+    verbose_cmd "sysfs virtfn count" "find '$PF_SYSFS_DIR' -maxdepth 1 -name 'virtfn*' -type l | wc -l"
     VF_SYSFS_COUNT=0
     while [ -d "$PF_SYSFS_DIR/virtfn$VF_SYSFS_COUNT" ]; do
         VF_SYSFS_COUNT=$((VF_SYSFS_COUNT + 1))
@@ -471,6 +526,7 @@ if [ -n "$PF_DEVICE" ]; then
         test_pass "Virtual Functions enumerated ($VF_SYSFS_COUNT found via sysfs)"
     else
         # Fallback: try lspci with device ID 8086:1889 (IAVF)
+        verbose_cmd "lspci -d 8086:1889 (VF count)" "lspci -d 8086:1889 | wc -l"
         VF_DEVICES=$(lspci -d 8086:1889 2>/dev/null | wc -l)
         VF_DEVICES=${VF_DEVICES:-0}
         if [ "$VF_DEVICES" -gt 0 ] 2>/dev/null; then
@@ -482,13 +538,14 @@ if [ -n "$PF_DEVICE" ]; then
     
     # Show VF device list
     test_info "VF Device List:"
+    verbose_cmd "lspci -d 8086:1889 (list)" "lspci -d 8086:1889"
     lspci -d 8086:1889 2>/dev/null | sed 's/^/  /' | head -5
-    [ -z "$(lspci -d 8086:1889 2>/dev/null)" ] && ls "$PF_SYSFS_DIR"/virtfn* 2>/dev/null | sed 's/^/  /' | head -5
 else
     test_fail "Virtual Functions enumerated" "PF not found"
 fi
 
 # Check driver binding
+verbose_cmd "ice driver in sysfs" "ls -l /sys/bus/pci/drivers/ | grep ice"
 DRIVER=$(ls -l /sys/bus/pci/drivers/ 2>/dev/null | grep ice | head -1 | awk '{print $NF}')
 if [ -n "$DRIVER" ]; then
     test_pass "ICE driver loaded ($DRIVER)"
@@ -497,6 +554,7 @@ else
 fi
 
 # Check iavf VF network interface detection
+verbose_cmd "get_iavf_ifaces" "get_iavf_ifaces"
 IAVF_IFACES=$(get_iavf_ifaces)
 IAVF_COUNT=0
 for iface in $IAVF_IFACES; do
@@ -504,6 +562,7 @@ for iface in $IAVF_IFACES; do
 done
 
 # PF interface count
+verbose_cmd "get_ice_ifaces" "get_ice_ifaces"
 ICE_PF_IFACES=$(get_ice_ifaces)
 ICE_PF_COUNT=0
 for iface in $ICE_PF_IFACES; do
@@ -826,6 +885,7 @@ else
             # Calculate corresponding peer IP (tap_ice0=.100, tap_ice1=.101, etc.)
             PORT_PEER_IP="${PEER_IP_PREFIX}.$((PEER_IP_START + PORT_NUM - 1))"
             
+            verbose_cmd "ip link show $IFACE" "ip link show '$IFACE'"
             if ! ip link show "$IFACE" &>/dev/null 2>&1; then
                 test_info "Port $PORT_NUM ($IFACE): Interface not found"
                 DATAPATH_FAIL=$((DATAPATH_FAIL + 1))
@@ -833,14 +893,18 @@ else
             fi
             
             # Bring interface up
+            verbose_cmd "ip link set $IFACE up" "ip link set '$IFACE' up"
             ip link set "$IFACE" up 2>/dev/null || true
             sleep 0.5  # Give interface time to come up
             
             # Flush any existing IPs and assign new one
+            verbose_cmd "ip addr flush dev $IFACE" "ip addr flush dev '$IFACE'"
             ip addr flush dev "$IFACE" 2>/dev/null || true
+            verbose_cmd "ip addr add $PORT_IP/24 dev $IFACE" "ip addr add '$PORT_IP/24' dev '$IFACE'"
             ip addr add "$PORT_IP/24" dev "$IFACE" 2>/dev/null || true
             
             # Verify IP was assigned (check for our specific IP)
+            verbose_cmd "ip -4 addr show dev $IFACE" "ip -4 addr show dev '$IFACE'"
             if ! ip -4 addr show dev "$IFACE" | grep -q "$PORT_IP"; then
                 test_info "Port $PORT_NUM ($IFACE): Failed to assign IP $PORT_IP"
                 DATAPATH_FAIL=$((DATAPATH_FAIL + 1))
@@ -852,6 +916,7 @@ else
             RX_BEFORE=$(get_iface_stat "$IFACE" rx_packets)
             
             # Perform ping test to this port's corresponding TAP device
+            verbose_cmd "ping -c 3 -W 2 $PORT_PEER_IP from $IFACE" "ping -c 3 -W 2 '$PORT_PEER_IP'"
             if ping -c 3 -W 2 "$PORT_PEER_IP" >/dev/null 2>&1; then
                 TX_AFTER=$(get_iface_stat "$IFACE" tx_packets)
                 RX_AFTER=$(get_iface_stat "$IFACE" rx_packets)
@@ -893,6 +958,7 @@ else
             VF_IP="192.168.200.$VF_NUM"
             VF_PEER_IP="192.168.200.$((100 + VF_NUM))"
 
+            verbose_cmd "ip link show $IFACE (VF)" "ip link show '$IFACE'"
             if ! ip link show "$IFACE" &>/dev/null 2>&1; then
                 test_info "VF $VF_NUM ($IFACE): Interface not found"
                 VF_DATAPATH_FAIL=$((VF_DATAPATH_FAIL + 1))
@@ -900,14 +966,18 @@ else
             fi
 
             # Bring interface up
+            verbose_cmd "ip link set $IFACE up (VF)" "ip link set '$IFACE' up"
             ip link set "$IFACE" up 2>/dev/null || true
             sleep 0.5
 
             # Flush any existing IPs and assign new one
+            verbose_cmd "ip addr flush dev $IFACE (VF)" "ip addr flush dev '$IFACE'"
             ip addr flush dev "$IFACE" 2>/dev/null || true
+            verbose_cmd "ip addr add $VF_IP/24 dev $IFACE (VF)" "ip addr add '$VF_IP/24' dev '$IFACE'"
             ip addr add "$VF_IP/24" dev "$IFACE" 2>/dev/null || true
 
             # Verify IP was assigned
+            verbose_cmd "ip -4 addr show dev $IFACE (VF)" "ip -4 addr show dev '$IFACE'"
             if ! ip -4 addr show dev "$IFACE" | grep -q "$VF_IP"; then
                 test_info "VF $VF_NUM ($IFACE): Failed to assign IP $VF_IP"
                 VF_DATAPATH_FAIL=$((VF_DATAPATH_FAIL + 1))
@@ -919,6 +989,7 @@ else
             RX_BEFORE=$(get_iface_stat "$IFACE" rx_packets)
 
             # Ping the loopback peer (QEMU VF emulates ARP/ICMP responses)
+            verbose_cmd "ping -c 3 -W 3 -I $IFACE $VF_PEER_IP (VF)" "ping -c 3 -W 3 -I '$IFACE' '$VF_PEER_IP'"
             if ping -c 3 -W 3 -I "$IFACE" "$VF_PEER_IP" >/dev/null 2>&1; then
                 TX_AFTER=$(get_iface_stat "$IFACE" tx_packets)
                 RX_AFTER=$(get_iface_stat "$IFACE" rx_packets)
