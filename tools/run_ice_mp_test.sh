@@ -755,7 +755,7 @@ boot_qemu() {
             break
         fi
         sleep 1
-        ((elapsed++))
+        elapsed=$((elapsed + 1))
     done
     
     # If QEMU is still running after timeout, kill it
