@@ -174,7 +174,7 @@ get_vf_count() {
 }
 
 get_ice_ifaces() {
-    # Try to use ethtool if available (more reliable in QEMU environment)
+    # Get all ICE PF interfaces
     if command -v ethtool &> /dev/null; then
         for iface in eth0 eth1 eth2 eth3; do
             if [ -e "/sys/class/net/$iface" ]; then
@@ -187,7 +187,7 @@ get_ice_ifaces() {
     else
         # Fall back to sysfs approach with parameter expansion
         local iface path driver driver_link
-        for path in /sys/class/net/eth*; do
+        for path in /sys/class/net/eth[0-3]; do
             [ -e "$path" ] || continue
             iface="${path##*/}"  # Parameter expansion instead of basename
             driver_link=$(readlink -f "$path/device/driver" 2>/dev/null)
@@ -197,6 +197,34 @@ get_ice_ifaces() {
             fi
         done
     fi
+}
+
+# Get all iavf VF interfaces
+get_iavf_ifaces() {
+    local iface path driver driver_link
+    for path in /sys/class/net/eth*; do
+        [ -e "$path" ] || continue
+        iface="${path##*/}"
+        # Skip PF interfaces (eth0-eth3)
+        case "$iface" in
+            eth0|eth1|eth2|eth3) continue ;;
+        esac
+        if command -v ethtool &> /dev/null; then
+            driver=$(ethtool -i "$iface" 2>/dev/null | grep "^driver:" | awk '{print $2}')
+        else
+            driver_link=$(readlink -f "$path/device/driver" 2>/dev/null)
+            driver="${driver_link##*/}"
+        fi
+        if [ "$driver" = "iavf" ]; then
+            echo "$iface"
+        fi
+    done
+}
+
+# Get all ICE + iavf interfaces (PF + VF)
+get_all_ice_ifaces() {
+    get_ice_ifaces
+    get_iavf_ifaces
 }
 
 get_first_ice_iface() {
@@ -468,13 +496,39 @@ else
     test_pass "ICE driver loaded (built-in)"
 fi
 
+# Check iavf VF network interface detection
+IAVF_IFACES=$(get_iavf_ifaces)
+IAVF_COUNT=0
+for iface in $IAVF_IFACES; do
+    IAVF_COUNT=$((IAVF_COUNT + 1))
+done
+
+# PF interface count
+ICE_PF_IFACES=$(get_ice_ifaces)
+ICE_PF_COUNT=0
+for iface in $ICE_PF_IFACES; do
+    ICE_PF_COUNT=$((ICE_PF_COUNT + 1))
+done
+
+TOTAL_IFACES=$((ICE_PF_COUNT + IAVF_COUNT))
+if [ "$IAVF_COUNT" -gt 0 ]; then
+    test_pass "VF network interfaces detected ($IAVF_COUNT VF + $ICE_PF_COUNT PF = $TOTAL_IFACES total)"
+    test_info "VF interfaces: $IAVF_IFACES"
+else
+    if [ "$VF_SYSFS_COUNT" -gt 0 ] 2>/dev/null || [ "$VF_DEVICES" -gt 0 ] 2>/dev/null; then
+        test_info "VFs enumerated at PCI level but no VF network interfaces (iavf driver may not be loaded)"
+    else
+        test_info "No VFs configured"
+    fi
+fi
+
 ################################################################################
 # Section 6: Interface Configuration Tests
 ################################################################################
 test_section 6 "Interface Configuration via ip"
 
 # Check interface count and state
-IFACE_COUNT=$(ip link show 2>/dev/null | grep "^[0-9]" | grep -E "eth[0-3]" | wc -l)
+IFACE_COUNT=$(ip link show 2>/dev/null | grep "^[0-9]" | grep -E " eth[0-3]:" | wc -l)
 if [ "$IFACE_COUNT" -eq 4 ]; then
     test_pass "All 4 interfaces present via ip link"
 else
@@ -757,7 +811,7 @@ else
     # Get all ICE interfaces
     ICE_IFACES=$(get_ice_ifaces)
     if [ -z "$ICE_IFACES" ]; then
-        test_fail "TX/RX datapath ping (all ports)" "No ICE interfaces found"
+        test_fail "TX/RX datapath ping (PF ports)" "No ICE PF interfaces found"
     else
         DATAPATH_PASS=0
         DATAPATH_FAIL=0
@@ -803,25 +857,93 @@ else
                 RX_AFTER=$(get_iface_stat "$IFACE" rx_packets)
                 
                 if [ "$TX_AFTER" -gt "$TX_BEFORE" ] && [ "$RX_AFTER" -gt "$RX_BEFORE" ]; then
-                    test_info "Port $PORT_NUM ($IFACE): TX/RX OK (tx: $TX_BEFORE->$TX_AFTER, rx: $RX_BEFORE->$RX_AFTER)"
+                    test_info "PF Port $PORT_NUM ($IFACE): TX/RX OK (tx: $TX_BEFORE->$TX_AFTER, rx: $RX_BEFORE->$RX_AFTER)"
                     DATAPATH_PASS=$((DATAPATH_PASS + 1))
                 else
-                    test_info "Port $PORT_NUM ($IFACE): ping OK, counters flat (tx: $TX_BEFORE->$TX_AFTER, rx: $RX_BEFORE->$RX_AFTER)"
+                    test_info "PF Port $PORT_NUM ($IFACE): ping OK, counters flat (tx: $TX_BEFORE->$TX_AFTER, rx: $RX_BEFORE->$RX_AFTER)"
                     DATAPATH_PASS=$((DATAPATH_PASS + 1))
                 fi
             else
-                test_info "Port $PORT_NUM ($IFACE): Ping to $PORT_PEER_IP failed"
+                test_info "PF Port $PORT_NUM ($IFACE): Ping to $PORT_PEER_IP failed"
                 DATAPATH_FAIL=$((DATAPATH_FAIL + 1))
             fi
         done
         
         # Report single aggregate datapath test result
         if [ "$DATAPATH_FAIL" -eq 0 ] && [ "$DATAPATH_PASS" -gt 0 ]; then
-            test_pass "TX/RX datapath ping (all $DATAPATH_PASS ports passed)"
+            test_pass "TX/RX datapath ping (all $DATAPATH_PASS PF ports passed)"
         else
-            test_fail "TX/RX datapath ping (all ports)" \
+            test_fail "TX/RX datapath ping (PF ports)" \
                 "Passed: $DATAPATH_PASS, Failed: $DATAPATH_FAIL (total: $PORT_NUM ports)"
         fi
+    fi
+
+    # VF datapath ping test
+    IAVF_IFACES=$(get_iavf_ifaces)
+    if [ -n "$IAVF_IFACES" ]; then
+        VF_DATAPATH_PASS=0
+        VF_DATAPATH_FAIL=0
+        VF_NUM=0
+
+        for IFACE in $IAVF_IFACES; do
+            VF_NUM=$((VF_NUM + 1))
+
+            # Assign unique VF IP in a different subnet to avoid conflicts
+            # VF IPs: 192.168.200.1, .2, .3, ...
+            VF_IP="192.168.200.$VF_NUM"
+            VF_PEER_IP="192.168.200.$((100 + VF_NUM))"
+
+            if ! ip link show "$IFACE" &>/dev/null 2>&1; then
+                test_info "VF $VF_NUM ($IFACE): Interface not found"
+                VF_DATAPATH_FAIL=$((VF_DATAPATH_FAIL + 1))
+                continue
+            fi
+
+            # Bring interface up
+            ip link set "$IFACE" up 2>/dev/null || true
+            sleep 0.5
+
+            # Flush any existing IPs and assign new one
+            ip addr flush dev "$IFACE" 2>/dev/null || true
+            ip addr add "$VF_IP/24" dev "$IFACE" 2>/dev/null || true
+
+            # Verify IP was assigned
+            if ! ip -4 addr show dev "$IFACE" | grep -q "$VF_IP"; then
+                test_info "VF $VF_NUM ($IFACE): Failed to assign IP $VF_IP"
+                VF_DATAPATH_FAIL=$((VF_DATAPATH_FAIL + 1))
+                continue
+            fi
+
+            # Capture baseline packet counts
+            TX_BEFORE=$(get_iface_stat "$IFACE" tx_packets)
+            RX_BEFORE=$(get_iface_stat "$IFACE" rx_packets)
+
+            # Ping the loopback peer (QEMU VF emulates ARP/ICMP responses)
+            if ping -c 3 -W 3 -I "$IFACE" "$VF_PEER_IP" >/dev/null 2>&1; then
+                TX_AFTER=$(get_iface_stat "$IFACE" tx_packets)
+                RX_AFTER=$(get_iface_stat "$IFACE" rx_packets)
+
+                if [ "$TX_AFTER" -gt "$TX_BEFORE" ] && [ "$RX_AFTER" -gt "$RX_BEFORE" ]; then
+                    test_info "VF $VF_NUM ($IFACE): TX/RX OK (tx: $TX_BEFORE->$TX_AFTER, rx: $RX_BEFORE->$RX_AFTER)"
+                    VF_DATAPATH_PASS=$((VF_DATAPATH_PASS + 1))
+                else
+                    test_info "VF $VF_NUM ($IFACE): ping OK, counters flat (tx: $TX_BEFORE->$TX_AFTER, rx: $RX_BEFORE->$RX_AFTER)"
+                    VF_DATAPATH_PASS=$((VF_DATAPATH_PASS + 1))
+                fi
+            else
+                test_info "VF $VF_NUM ($IFACE): Ping to $VF_PEER_IP failed"
+                VF_DATAPATH_FAIL=$((VF_DATAPATH_FAIL + 1))
+            fi
+        done
+
+        if [ "$VF_DATAPATH_FAIL" -eq 0 ] && [ "$VF_DATAPATH_PASS" -gt 0 ]; then
+            test_pass "TX/RX datapath ping (all $VF_DATAPATH_PASS VF ports passed)"
+        else
+            test_fail "TX/RX datapath ping (VF ports)" \
+                "Passed: $VF_DATAPATH_PASS, Failed: $VF_DATAPATH_FAIL (total: $VF_NUM VF ports)"
+        fi
+    else
+        test_info "No VF interfaces detected; VF datapath test skipped"
     fi
 fi
 

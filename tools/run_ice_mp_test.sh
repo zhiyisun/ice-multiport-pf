@@ -201,8 +201,8 @@ cleanup_old_artifacts() {
         log_info "  Removed old DDP package"
     fi
     
-    # Remove QEMU build directory for clean rebuild
-    if [ -d "$QEMU_BUILD_BINDIR" ]; then
+    # Remove QEMU build directory for clean rebuild (only if not skipping QEMU build)
+    if [ $SKIP_QEMU_BUILD -eq 0 ] && [ -d "$QEMU_BUILD_BINDIR" ]; then
         rm -rf "$QEMU_BUILD_BINDIR"
         log_info "  Removed QEMU build directory"
     fi
@@ -318,6 +318,7 @@ ensure_kernel_config() {
     ./scripts/config --enable CONFIG_PCI_IOV
     ./scripts/config --enable CONFIG_NET_VENDOR_INTEL
     ./scripts/config --enable CONFIG_ICE
+    ./scripts/config --enable CONFIG_I40EVF
     ./scripts/config --enable CONFIG_VLAN_8021Q
     ./scripts/config --enable CONFIG_BRIDGE
     ./scripts/config --enable CONFIG_TUN
@@ -527,13 +528,38 @@ else
     log "lspci not available"
 fi
 
-log "Network interfaces:"
+log "Network interfaces (PF only):"
 ip link show
 
 # Check if ICE devices are present
 ice_count=$(ip link show 2>/dev/null | grep -c "^[0-9]*: eth[0-3]:" 2>/dev/null || true)
 ice_count=${ice_count:-0}
-log "Found $ice_count ICE network interfaces"
+log "Found $ice_count ICE PF network interfaces"
+
+# Wait for iavf VF interfaces to appear (driver built-in)
+# VFs are auto-created by SR-IOV, iavf driver probes them
+EXPECTED_VFS="__ICE_MP_EXPECTED_VFS__"
+if [ "$EXPECTED_VFS" -gt 0 ] 2>/dev/null; then
+    log "Waiting for $EXPECTED_VFS VF interfaces (iavf driver)..."
+    VF_WAIT=0
+    while [ "$VF_WAIT" -lt 90 ]; do
+        # Count all eth interfaces beyond eth0-eth3 (VF interfaces)
+        vf_count=$(ls -d /sys/class/net/eth* 2>/dev/null | wc -l)
+        vf_count=$((vf_count - ice_count))
+        if [ "$vf_count" -ge "$EXPECTED_VFS" ]; then
+            log "Found $vf_count VF interfaces"
+            break
+        fi
+        sleep 1
+        VF_WAIT=$((VF_WAIT + 1))
+    done
+    if [ "$VF_WAIT" -ge 90 ]; then
+        log "WARNING: Timeout waiting for VF interfaces (found $vf_count, expected $EXPECTED_VFS)"
+    fi
+fi
+
+log "All network interfaces (PF + VF):"
+ip link show
 
 # Datapath test configuration injected by host script
 export ICE_MP_TEST_PEER_IP="__ICE_MP_TEST_PEER_IP__"
