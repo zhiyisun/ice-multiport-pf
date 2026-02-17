@@ -241,12 +241,17 @@ sudo apt-get install -y build-essential meson ninja-build \
 ### Linux Driver (`build/linux/drivers/net/ethernet/intel/ice/`)
 - **Base:** Linux kernel v6.19 ICE driver
 - **Modifications:** Multi-port PF support (production-ready)
-- **Files Modified:** 16 files with multi-port support added
-- **New Modules:** 4 new files for multi-port functionality (~1000 lines)
-- **Production Quality:** All debug code removed, ready for upstream
+- **Files Modified:** 16 files total (12 existing + 4 new)
+- **Code Changes:** +1,183 lines, -29 lines (net +1,154)
+- **New Modules:** 4 new files for multi-port functionality
+  - `ice_multiport.c` (433 lines) - Core multi-port logic
+  - `ice_multiport.h` (92 lines) - Data structures
+  - `ice_multiport_adminq.c` (162 lines) - AdminQ firmware communication
+  - `ice_mp_sysfs.c` (~300 lines) - Sysfs management interface
+- **Production Quality:** All debug code removed, kernel standards met
 - **Device ID:** Updated to production E810-C device ID (0x1592)
 - **Key Features:**
-  - Multi-port AdminQ handling with firmware-based port detection
+  - Multi-port AdminQ handling with firmware-based port detection (cmd 0x06EA)
   - Per-port resource management and isolation
   - Enhanced SR-IOV support with per-port VFs
   - Per-port interrupt demultiplexing (MSI-X)
