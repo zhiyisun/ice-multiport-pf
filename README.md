@@ -303,7 +303,6 @@ git submodule update --remote
 
 ### Device Verification
 ✅ **Device ID Updated** - Now using production Intel E810-C device ID (0x1592)
-- Previously used test device ID (0xFFFF) - now replaced
 - Firmware-based multi-port detection via AdminQ command 0x06EA
 - Backward compatible with single-port hardware
 
