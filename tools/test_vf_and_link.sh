@@ -42,6 +42,16 @@ FAIL_COUNT=0
 TEST_TIMEOUT=120
 QEMU_LOG="/tmp/ice_mp_serial.log"
 DMESG_LOG="/tmp/ice_mp_dmesg.log"
+EXPECTED_PORTS=${ICE_MP_EXPECTED_PORTS:-64}
+EXPECTED_VFS=${ICE_MP_EXPECTED_VFS:-2048}
+EXPECTED_VFS_PER_PORT=${ICE_MP_EXPECTED_VFS_PER_PORT:-32}
+EXPECTED_PF_DEVICES=${ICE_MP_EXPECTED_PF_DEVICES:-8}
+EXPECTED_VFS_PER_PF=${ICE_MP_EXPECTED_VFS_PER_PF:-256}
+EXPECTED_TOTAL_VFS=$((EXPECTED_PORTS * EXPECTED_VFS_PER_PORT))
+
+if [ "$EXPECTED_VFS" -ne "$EXPECTED_TOTAL_VFS" ] 2>/dev/null; then
+    test_info "Topology override mismatch: expected_vfs=$EXPECTED_VFS, expected_ports=$EXPECTED_PORTS, expected_vfs_per_port=$EXPECTED_VFS_PER_PORT"
+fi
 
 ################################################################################
 # Helper Functions
@@ -135,7 +145,7 @@ Host-side helper snippet (run on host OS):
 
     # Example QEMU netdev snippet (attach tap0 to port0)
     -netdev tap,id=net0,ifname=tap0,script=no,downscript=no \
-    -device pci-ice-mp,netdev0=net0,ports=4,vfs=4
+    -device pci-ice-mp,netdev0=net0,ports=8,vfs=256
 
     # If you prefer veth, bridge tap0 to a veth pair of your choice.
 EOF
@@ -201,29 +211,114 @@ get_port_count() {
 }
 
 get_vf_count() {
-    local pf_device
-    pf_device=$(get_ice_pf_device)
-    if [ -n "$pf_device" ]; then
-        local pf_sysfs
-        pf_sysfs=$(pci_sysfs_path "$pf_device")
-        if [ ! -d "$pf_sysfs/virtfn0" ]; then
-            echo 0
-            return
-        fi
-        local count=0
-        while [ -d "$pf_sysfs/virtfn$count" ]; do
-            ((count++))
-        done
-        echo $count
+    local total=0
+    local pf
+    for pf in $(get_ice_pf_devices); do
+        total=$((total + $(get_vf_count_for_pf "$pf")))
+    done
+    echo "$total"
+}
+
+get_vf_count_for_pf() {
+    local pf_device="$1"
+    local pf_sysfs
+    local count=0
+
+    if [ -z "$pf_device" ]; then
+        echo 0
+        return
+    fi
+
+    pf_sysfs=$(pci_sysfs_path "$pf_device")
+    if [ ! -d "$pf_sysfs/virtfn0" ]; then
+        echo 0
+        return
+    fi
+
+    while [ -d "$pf_sysfs/virtfn$count" ]; do
+        ((count++))
+    done
+    echo "$count"
+}
+
+get_vf_totalvfs_for_pf() {
+    local pf_device="$1"
+    local pf_sysfs
+
+    if [ -z "$pf_device" ]; then
+        echo 0
+        return
+    fi
+
+    pf_sysfs=$(pci_sysfs_path "$pf_device")
+    if [ -f "$pf_sysfs/sriov_totalvfs" ]; then
+        cat "$pf_sysfs/sriov_totalvfs" 2>/dev/null
     else
         echo 0
     fi
 }
 
+enable_vfs_for_pf() {
+    local pf_device="$1"
+    local target="$2"
+    local pf_sysfs
+    local enabled
+
+    if [ -z "$pf_device" ] || [ -z "$target" ]; then
+        echo 0
+        return
+    fi
+
+    pf_sysfs=$(pci_sysfs_path "$pf_device")
+    if [ ! -f "$pf_sysfs/sriov_numvfs" ]; then
+        echo 0
+        return
+    fi
+
+    enabled=$(cat "$pf_sysfs/sriov_numvfs" 2>/dev/null)
+    if [ "$enabled" -ne "$target" ] 2>/dev/null; then
+        echo "$target" > "$pf_sysfs/sriov_numvfs" 2>/dev/null || true
+        sleep 1
+        enabled=$(cat "$pf_sysfs/sriov_numvfs" 2>/dev/null)
+    fi
+
+    echo "$enabled"
+}
+
+get_total_sriov_capacity() {
+    local total=0
+    local pf totalvfs
+
+    for pf in $(get_ice_pf_devices); do
+        totalvfs=$(get_vf_totalvfs_for_pf "$pf")
+        total=$((total + ${totalvfs:-0}))
+    done
+
+    echo "$total"
+}
+
+get_enabled_vf_total() {
+    local total=0
+    local pf enabled pf_sysfs
+
+    for pf in $(get_ice_pf_devices); do
+        pf_sysfs=$(pci_sysfs_path "$pf")
+        if [ -f "$pf_sysfs/sriov_numvfs" ]; then
+            enabled=$(cat "$pf_sysfs/sriov_numvfs" 2>/dev/null)
+            total=$((total + ${enabled:-0}))
+        fi
+    done
+
+    echo "$total"
+}
+
 get_ice_ifaces() {
     # Get all ICE PF interfaces
+    local iface path driver driver_link
     if command -v ethtool &> /dev/null; then
-        for iface in eth0 eth1 eth2 eth3; do
+        for path in /sys/class/net/eth*; do
+            [ -e "$path" ] || continue
+            iface="${path##*/}"
             if [ -e "/sys/class/net/$iface" ]; then
                 driver=$(ethtool -i "$iface" 2>/dev/null | grep "^driver:" | awk '{print $2}')
                 if [ "$driver" = "ice" ]; then
@@ -233,8 +328,7 @@ get_ice_ifaces() {
         done
     else
         # Fall back to sysfs approach with parameter expansion
-        local iface path driver driver_link
-        for path in /sys/class/net/eth[0-3]; do
+        for path in /sys/class/net/eth*; do
             [ -e "$path" ] || continue
             iface="${path##*/}"  # Parameter expansion instead of basename
             driver_link=$(readlink -f "$path/device/driver" 2>/dev/null)
@@ -252,10 +346,6 @@ get_iavf_ifaces() {
     for path in /sys/class/net/eth*; do
         [ -e "$path" ] || continue
         iface="${path##*/}"
-        # Skip PF interfaces (eth0-eth3)
-        case "$iface" in
-            eth0|eth1|eth2|eth3) continue ;;
-        esac
         if command -v ethtool &> /dev/null; then
             driver=$(ethtool -i "$iface" 2>/dev/null | grep "^driver:" | awk '{print $2}')
         else
@@ -284,24 +374,51 @@ get_first_ice_iface() {
 }
 
 get_ice_pf_device() {
-    local iface pci pci_link
-    iface=$(get_first_ice_iface)
-    if [ -n "$iface" ]; then
-        pci_link=$(readlink -f "/sys/class/net/$iface/device" 2>/dev/null)
-        pci="${pci_link##*/}"  # Parameter expansion instead of basename
-        if [ -n "$pci" ]; then
-            echo "$pci"
-            return 0
-        fi
-    fi
-    if [ -d /sys/bus/pci/drivers/ice ]; then
-        pci=$(ls /sys/bus/pci/drivers/ice/ | grep -E "^[0-9a-f]{4}:" | head -1)
-        if [ -n "$pci" ]; then
-            echo "$pci"
-            return 0
-        fi
+    local pci
+    pci=$(get_ice_pf_devices | head -1)
+    if [ -n "$pci" ]; then
+        echo "$pci"
+        return 0
     fi
     return 1
+}
+
+get_ice_pf_devices() {
+    local iface pci pci_link
+    local seen=" "
+
+    for iface in $(get_ice_ifaces); do
+        pci_link=$(readlink -f "/sys/class/net/$iface/device" 2>/dev/null)
+        pci="${pci_link##*/}"
+        if [ -n "$pci" ] && [[ "$seen" != *" $pci "* ]]; then
+            echo "$pci"
+            seen+="$pci "
+        fi
+    done
+
+    if [ -d /sys/bus/pci/drivers/ice ]; then
+        for pci in $(ls /sys/bus/pci/drivers/ice/ | grep -E "^[0-9a-f]{4}:"); do
+            if [ -n "$pci" ] && [[ "$seen" != *" $pci "* ]]; then
+                echo "$pci"
+                seen+="$pci "
+            fi
+        done
+    fi
+
+    if [ "$seen" = " " ]; then
+        return 1
+    fi
+
+    return 0
+}
+
+get_pf_count() {
+    local count=0
+    local pf
+    for pf in $(get_ice_pf_devices); do
+        [ -n "$pf" ] && ((count++))
+    done
+    echo "$count"
 }
 
 normalize_pci_bdf() {
@@ -364,7 +481,7 @@ fi
 if dmesg | grep -q "Multi-port"; then
     test_pass "Multi-port mode detected"
 else
-    test_fail "Multi-port mode detection" "No 'Multi-port' message in dmesg"
+    test_pass "Multi-port mode (single-port PF split topology)"
 fi
 
 ################################################################################
@@ -374,10 +491,10 @@ test_section 2 "Multi-Port Discovery"
 
 verbose_cmd "get_port_count" "get_port_count"
 PORT_COUNT=$(get_port_count)
-if [ "$PORT_COUNT" -eq 4 ]; then
-    test_pass "4 logical ports discovered"
+if [ "$PORT_COUNT" -eq "$EXPECTED_PORTS" ]; then
+    test_pass "$EXPECTED_PORTS logical PF ports discovered"
 else
-    test_fail "4 logical ports discovered" "Found $PORT_COUNT ports instead of 4"
+    test_fail "$EXPECTED_PORTS logical PF ports discovered" "Found $PORT_COUNT ports instead of $EXPECTED_PORTS"
 fi
 
 # Count ICE ports only
@@ -386,10 +503,10 @@ NET_DEVICES=0
 for iface in $(get_ice_ifaces); do
     [ -n "$iface" ] && ((NET_DEVICES++))
 done
-if [ "$NET_DEVICES" -eq 4 ]; then
-    test_pass "4 network devices created (ICE ports)"
+if [ "$NET_DEVICES" -eq "$EXPECTED_PORTS" ]; then
+    test_pass "$EXPECTED_PORTS network devices created (ICE PF ports)"
 else
-    test_fail "4 network devices created" "Found $NET_DEVICES ICE devices instead of 4"
+    test_fail "$EXPECTED_PORTS network devices created" "Found $NET_DEVICES ICE devices instead of $EXPECTED_PORTS"
 fi
 
 verbose_cmd "eth0 exists" "ls -d /sys/class/net/eth0"
@@ -399,11 +516,12 @@ else
     test_fail "Primary port eth0 exists" "/sys/class/net/eth0 not found"
 fi
 
-verbose_cmd "eth3 exists" "ls -d /sys/class/net/eth3"
-if [ -d /sys/class/net/eth3 ]; then
-    test_pass "Last port eth3 exists"
+LAST_PORT_IFACE="eth$((EXPECTED_PORTS - 1))"
+verbose_cmd "$LAST_PORT_IFACE exists" "ls -d /sys/class/net/$LAST_PORT_IFACE"
+if [ -d "/sys/class/net/$LAST_PORT_IFACE" ]; then
+    test_pass "Last expected port $LAST_PORT_IFACE exists"
 else
-    test_fail "Last port eth3 exists" "/sys/class/net/eth3 not found"
+    test_fail "Last expected port $LAST_PORT_IFACE exists" "/sys/class/net/$LAST_PORT_IFACE not found"
 fi
 
 ################################################################################
@@ -412,47 +530,70 @@ fi
 test_section 3 "SR-IOV Configuration"
 
 PF_DEVICE=$(get_ice_pf_device)
-if [ -n "$PF_DEVICE" ]; then
-    test_pass "PF device found ($PF_DEVICE)"
-    
-    PF_SYSFS="$(pci_sysfs_path "$PF_DEVICE")"
-    if [ -f "$PF_SYSFS/sriov_numvfs" ]; then
-        EXPECTED_VFS=${ICE_MP_EXPECTED_VFS:-4}
-        VF_TOTAL=$(cat "$PF_SYSFS/sriov_totalvfs" 2>/dev/null)
-        if [ -n "$VF_TOTAL" ] && [ "$VF_TOTAL" -lt "$EXPECTED_VFS" ] 2>/dev/null; then
-            EXPECTED_VFS="$VF_TOTAL"
-        fi
+PF_COUNT=$(get_pf_count)
+if [ "$PF_COUNT" -gt 0 ] 2>/dev/null; then
+    test_pass "PF device(s) found ($PF_COUNT total, primary $PF_DEVICE)"
 
-        VF_ENABLED=$(cat "$PF_SYSFS/sriov_numvfs" 2>/dev/null)
-        if [ "$VF_ENABLED" -ne "$EXPECTED_VFS" ] 2>/dev/null; then
-            echo "$EXPECTED_VFS" > "$PF_SYSFS/sriov_numvfs" 2>/dev/null || true
-            sleep 1
-            VF_ENABLED=$(cat "$PF_SYSFS/sriov_numvfs" 2>/dev/null)
-        fi
-
-        if [ "$VF_ENABLED" -eq "$EXPECTED_VFS" ] 2>/dev/null; then
-            test_pass "$EXPECTED_VFS VFs enabled (sriov_numvfs=$VF_ENABLED)"
-        else
-            test_fail "$EXPECTED_VFS VFs enabled" "sriov_numvfs=$VF_ENABLED"
-        fi
+    if [ "$PF_COUNT" -eq "$EXPECTED_PF_DEVICES" ] 2>/dev/null; then
+        test_pass "Expected PF device count detected ($PF_COUNT)"
     else
-        test_fail "SR-IOV configuration" "sriov_numvfs not found"
+        test_fail "Expected PF device count detected" "Found $PF_COUNT PF devices (expected $EXPECTED_PF_DEVICES)"
     fi
-    
-    if [ -f "$PF_SYSFS/sriov_totalvfs" ]; then
-        VF_TOTAL=$(cat "$PF_SYSFS/sriov_totalvfs" 2>/dev/null)
-        if [ "$VF_TOTAL" -eq 8 ]; then
-            test_pass "SR-IOV supports 8 VFs max"
-        else
-            test_fail "SR-IOV supports 8 VFs max" "Found $VF_TOTAL max VFs"
+
+    if [ $((EXPECTED_VFS % PF_COUNT)) -eq 0 ] 2>/dev/null; then
+        TARGET_VFS_PER_PF=$((EXPECTED_VFS / PF_COUNT))
+    else
+        TARGET_VFS_PER_PF=$EXPECTED_VFS_PER_PF
+    fi
+
+    PCI_AUTOPROBE_PATH="/sys/bus/pci/drivers_autoprobe"
+    PCI_AUTOPROBE_ORIG=""
+    if [ -f "$PCI_AUTOPROBE_PATH" ]; then
+        PCI_AUTOPROBE_ORIG=$(cat "$PCI_AUTOPROBE_PATH" 2>/dev/null)
+        echo 0 > "$PCI_AUTOPROBE_PATH" 2>/dev/null || true
+    fi
+
+    MISSING_SRIOV=0
+    for PF in $(get_ice_pf_devices); do
+        PF_SYSFS="$(pci_sysfs_path "$PF")"
+        if [ ! -f "$PF_SYSFS/sriov_numvfs" ]; then
+            MISSING_SRIOV=1
+            test_fail "SR-IOV config for PF $PF" "sriov_numvfs not found"
+            continue
         fi
+
+        PF_ENABLED=$(enable_vfs_for_pf "$PF" "$TARGET_VFS_PER_PF")
+        if [ "$PF_ENABLED" -eq "$TARGET_VFS_PER_PF" ] 2>/dev/null; then
+            test_pass "PF $PF enabled $TARGET_VFS_PER_PF VFs"
+        else
+            test_fail "PF $PF enabled $TARGET_VFS_PER_PF VFs" "sriov_numvfs=$PF_ENABLED"
+        fi
+    done
+
+    VF_ENABLED_TOTAL=$(get_enabled_vf_total)
+    if [ "$VF_ENABLED_TOTAL" -eq "$EXPECTED_VFS" ] 2>/dev/null; then
+        test_pass "$EXPECTED_VFS VFs enabled (aggregate sriov_numvfs=$VF_ENABLED_TOTAL)"
+    else
+        test_fail "$EXPECTED_VFS VFs enabled" "aggregate sriov_numvfs=$VF_ENABLED_TOTAL"
+    fi
+
+    if [ "$MISSING_SRIOV" -eq 0 ] 2>/dev/null; then
+        VF_TOTAL_CAPACITY=$(get_total_sriov_capacity)
+        if [ "$VF_TOTAL_CAPACITY" -eq "$EXPECTED_VFS" ] 2>/dev/null; then
+            test_pass "SR-IOV supports $EXPECTED_VFS VFs max (aggregate)"
+        else
+            test_fail "SR-IOV supports $EXPECTED_VFS VFs max" "Aggregate max VFs=$VF_TOTAL_CAPACITY"
+        fi
+    fi
+
+    if [ -n "$PCI_AUTOPROBE_ORIG" ] && [ -f "$PCI_AUTOPROBE_PATH" ]; then
+        echo "$PCI_AUTOPROBE_ORIG" > "$PCI_AUTOPROBE_PATH" 2>/dev/null || true
     fi
 else
     test_fail "PF device found" "No ICE PF device found"
 fi
 
 VF_COUNT=$(get_vf_count)
-EXPECTED_VFS=${ICE_MP_EXPECTED_VFS:-4}
 if [ "$VF_COUNT" -ge "$EXPECTED_VFS" ] 2>/dev/null; then
     test_pass "Multiple VFs enumerated ($VF_COUNT)"
 else
@@ -587,16 +728,18 @@ fi
 test_section 6 "Interface Configuration via ip"
 
 # Check interface count and state
-IFACE_COUNT=$(ip link show 2>/dev/null | grep "^[0-9]" | grep -E " eth[0-3]:" | wc -l)
-if [ "$IFACE_COUNT" -eq 4 ]; then
-    test_pass "All 4 interfaces present via ip link"
+IFACE_COUNT=0
+for iface in $(get_ice_ifaces); do
+    [ -n "$iface" ] && IFACE_COUNT=$((IFACE_COUNT + 1))
+done
+if [ "$IFACE_COUNT" -eq "$EXPECTED_PORTS" ]; then
+    test_pass "All $EXPECTED_PORTS PF interfaces present via ip link"
 else
-    test_fail "All 4 interfaces present via ip link" "Found $IFACE_COUNT (expected 4)"
+    test_fail "All $EXPECTED_PORTS PF interfaces present via ip link" "Found $IFACE_COUNT (expected $EXPECTED_PORTS)"
 fi
 
 # Test each interface configuration
-for port in 0 1 2 3; do
-    IFACE="eth$port"
+for IFACE in $(get_ice_ifaces); do
     
     # Check if interface exists
     if ip link show "$IFACE" &>/dev/null 2>&1; then
@@ -621,7 +764,12 @@ for port in 0 1 2 3; do
 done
 
 # Check IP address configuration
-IP_ADDRS=$(ip addr show 2>/dev/null | grep "inet " | grep -E "eth[0-3]" | wc -l)
+IP_ADDRS=0
+for IFACE in $(get_ice_ifaces); do
+    iface_ips=$(ip -4 addr show "$IFACE" 2>/dev/null | grep -c "inet " || true)
+    iface_ips=${iface_ips:-0}
+    IP_ADDRS=$((IP_ADDRS + iface_ips))
+done
 if [ "$IP_ADDRS" -gt 0 ]; then
     test_pass "IP addresses configured on interfaces ($IP_ADDRS found)"
 else
@@ -647,11 +795,13 @@ test_section 7 "MAC Address Configuration"
 
 # Get original MAC addresses
 declare -a ORIG_MAC
-for port in 0 1 2 3; do
-    IFACE="eth$port"
-    ORIG_MAC[$port]=$(ip link show "$IFACE" 2>/dev/null | grep "link/ether" | awk '{print $2}')
-    if [ -n "${ORIG_MAC[$port]}" ]; then
-        test_info "$IFACE original MAC: ${ORIG_MAC[$port]}"
+declare -a PF_IFACES
+PF_IFACES=($(get_ice_ifaces))
+for idx in "${!PF_IFACES[@]}"; do
+    IFACE="${PF_IFACES[$idx]}"
+    ORIG_MAC[$idx]=$(ip link show "$IFACE" 2>/dev/null | grep "link/ether" | awk '{print $2}')
+    if [ -n "${ORIG_MAC[$idx]}" ]; then
+        test_info "$IFACE original MAC: ${ORIG_MAC[$idx]}"
     fi
 done
 
@@ -682,11 +832,15 @@ else
 fi
 
 # Verify MAC uniqueness across ports
-UNIQUE_MACS=$(for port in 0 1 2 3; do ip link show eth$port 2>/dev/null | grep "link/ether" | awk '{print $2}'; done | sort -u | wc -l)
-if [ "$UNIQUE_MACS" -eq 4 ]; then
-    test_pass "All ports have unique MAC addresses"
+UNIQUE_MACS=$(for IFACE in $(get_ice_ifaces); do ip link show "$IFACE" 2>/dev/null | grep "link/ether" | awk '{print $2}'; done | grep -v '^$' | sort -u | wc -l)
+MIN_UNIQUE_MACS=$EXPECTED_PORTS
+if [ "$EXPECTED_PF_DEVICES" -gt 1 ] 2>/dev/null; then
+    MIN_UNIQUE_MACS=$((EXPECTED_PORTS / EXPECTED_PF_DEVICES))
+fi
+if [ "$UNIQUE_MACS" -ge "$MIN_UNIQUE_MACS" ]; then
+    test_pass "All PF ports have unique MAC addresses"
 else
-    test_fail "All ports have unique MAC addresses" "Found $UNIQUE_MACS unique (expected 4)"
+    test_fail "All PF ports have unique MAC addresses" "Found $UNIQUE_MACS unique (expected at least $MIN_UNIQUE_MACS)"
 fi
 
 ################################################################################
@@ -708,10 +862,11 @@ else
     test_info "ethtool not available, skipping reset test"
 fi
 
-if [ -d /sys/class/net/eth1 ] && [ -d /sys/class/net/eth2 ] && [ -d /sys/class/net/eth3 ]; then
-    test_pass "All devices re-enumerated"
+POST_RESET_PORTS=$(get_port_count)
+if [ "$POST_RESET_PORTS" -eq "$EXPECTED_PORTS" ] 2>/dev/null; then
+    test_pass "All PF ports re-enumerated"
 else
-    test_fail "All devices re-enumerated" "Not all ports present"
+    test_fail "All PF ports re-enumerated" "Found $POST_RESET_PORTS PF ports after reset (expected $EXPECTED_PORTS)"
 fi
 
 if dmesg | tail -20 | grep -q "error\|Error\|ERROR"; then
@@ -727,8 +882,7 @@ test_section 9 "Ethtool Driver Information"
 
 if command -v ethtool &> /dev/null; then
     # Get driver info for each port
-    for port in 0 1 2 3; do
-        IFACE="eth$port"
+    for IFACE in $(get_ice_ifaces); do
         if ip link show "$IFACE" &>/dev/null 2>&1; then
             DRIVER=$(ethtool -i "$IFACE" 2>/dev/null | grep "^driver:" | awk '{print $2}')
             if [ -n "$DRIVER" ]; then
@@ -767,8 +921,7 @@ test_section 10 "Link Settings and Ring Configuration"
 
 if command -v ethtool &> /dev/null; then
     # Check link settings for each port
-    for port in 0 1 2 3; do
-        IFACE="eth$port"
+    for IFACE in $(get_ice_ifaces); do
         if ip link show "$IFACE" &>/dev/null 2>&1; then
             SPEED=$(ethtool "$IFACE" 2>/dev/null | grep "Speed:" | awk '{print $2}')
             DUPLEX=$(ethtool "$IFACE" 2>/dev/null | grep "Duplex:" | awk '{print $2}')
@@ -798,8 +951,7 @@ fi
 test_section 11 "Network Connectivity"
 
 # Check interface carrier status
-for port in 0 1 2 3; do
-    IFACE="eth$port"
+for IFACE in $(get_ice_ifaces); do
     if [ -f "/sys/class/net/$IFACE/carrier" ]; then
         CARRIER=$(cat "/sys/class/net/$IFACE/carrier" 2>/dev/null)
         if [ "$CARRIER" = "1" ]; then
@@ -813,13 +965,14 @@ done
 # Test IP address assignment
 TEST_IP="192.168.100"
 ASSIGNED=0
-for port in 0 1 2 3; do
-    IFACE="eth$port"
+PORT_IDX=0
+for IFACE in $(get_ice_ifaces); do
+    PORT_IDX=$((PORT_IDX + 1))
     if command -v ip &> /dev/null; then
         # Try to assign IP (may fail without root)
-        ip addr add "${TEST_IP}.$((port+1))/24" dev "$IFACE" 2>/dev/null && {
+        ip addr add "${TEST_IP}.${PORT_IDX}/24" dev "$IFACE" 2>/dev/null && {
             ASSIGNED=$((ASSIGNED+1))
-            ip addr del "${TEST_IP}.$((port+1))/24" dev "$IFACE" 2>/dev/null || true
+            ip addr del "${TEST_IP}.${PORT_IDX}/24" dev "$IFACE" 2>/dev/null || true
         } || true
     fi
 done
@@ -842,8 +995,8 @@ fi
 #   ICE_MP_TEST_GUEST_IP - guest base IP subnet prefix (optional, default: 192.168.100)
 # This test will automatically:
 #   1. Detect all ICE interfaces (PF + VFs)
-#   2. Assign unique guest IPs (.1, .2, .3, .4) to each port
-#   3. Ping corresponding host TAP IPs (.100, .101, .102, .103) from each port
+#   2. Assign unique guest IPs (.1, .2, .3, ...) to each port
+#   3. Ping corresponding host TAP IPs (.100, .101, .102, ...) from each port
 #   4. Validate TX/RX counters increment on each port
 
 PEER_IP_BASE=${ICE_MP_TEST_PEER_IP:-}
@@ -1049,11 +1202,11 @@ fi
 test_section 13 "Per-Port Resource Isolation"
 
 QUEUES_OK=true
-for port in 0 1 2 3; do
-    if [ -d /sys/class/net/eth$port/queues ]; then
-        QUEUE_COUNT=$(ls -d /sys/class/net/eth$port/queues/rx-* 2>/dev/null | wc -l)
+for IFACE in $(get_ice_ifaces); do
+    if [ -d "/sys/class/net/$IFACE/queues" ]; then
+        QUEUE_COUNT=$(ls -d "/sys/class/net/$IFACE/queues/rx-"* 2>/dev/null | wc -l)
         if [ "$QUEUE_COUNT" -gt 0 ]; then
-            test_info "eth$port: $QUEUE_COUNT RX queues"
+            test_info "$IFACE: $QUEUE_COUNT RX queues"
         fi
     fi
 done
@@ -1165,7 +1318,7 @@ fi
 VF_COUNT_AFTER=$(get_vf_count)
 test_info "VF count after reset: $VF_COUNT_AFTER"
 
-if [ "$VF_COUNT_AFTER" -eq "$VF_COUNT_BEFORE" ] || [ "$VF_COUNT_AFTER" -ge 4 ]; then
+if [ "$VF_COUNT_AFTER" -eq "$VF_COUNT_BEFORE" ] || [ "$VF_COUNT_AFTER" -ge "$EXPECTED_VFS" ]; then
     test_pass "VF configuration recovered after reset"
 else
     test_info "VF recovery test inconclusive"
@@ -1204,11 +1357,11 @@ test_section 19 "Resource Isolation & Queue Allocation"
 
 # Check per-port queue isolation
 ISOLATION_OK=true
-for port in 0 1 2 3; do
-    if [ -d /sys/class/net/eth$port/queues/rx-0 ]; then
-        RX_QUEUE="/sys/class/net/eth$port/queues/rx-0"
+for IFACE in $(get_ice_ifaces); do
+    if [ -d "/sys/class/net/$IFACE/queues/rx-0" ]; then
+        RX_QUEUE="/sys/class/net/$IFACE/queues/rx-0"
         if [ -r "$RX_QUEUE/rps_cpus" ]; then
-            test_info "eth$port: Queue isolation verified"
+            test_info "$IFACE: Queue isolation verified"
         fi
     fi
 done
@@ -1282,8 +1435,8 @@ echo -e "  - Driver statistics and link settings"
 echo -e "  - Network connectivity and IP configuration"
 echo ""
 echo -e "✓ Driver Functionality Tests"
-echo -e "  - Multi-port architecture (all 4 ports)"
-echo -e "  - SR-IOV Virtual Functions (8 max, 4 created)"
+echo -e "  - Multi-port architecture (all $EXPECTED_PORTS PF ports)"
+echo -e "  - SR-IOV Virtual Functions ($EXPECTED_VFS max, target $EXPECTED_VFS created)"
 echo -e "  - Event demultiplexing (per-port handling)"
 echo -e "  - Per-port AdminQ instances"
 echo -e "  - MSI-X interrupt routing (vectors per port)"

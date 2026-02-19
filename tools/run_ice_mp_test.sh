@@ -30,8 +30,12 @@
 #   ICE_MP_KERNEL      Path to Linux kernel (default: ./build/linux/arch/x86_64/boot/bzImage)
 #   ICE_MP_ROOTFS      Path to rootfs (default: ./build/rootfs.cpio)
 #   ICE_MP_DDP         Path to DDP package (default: ./build/ice.pkg)
-#   ICE_MP_PORTS       Number of ports (default: 4)
-#   ICE_MP_VFS         Number of VFs total (default: 8)
+#   ICE_MP_PF_DEVICES  Number of PF devices (default: 8)
+#   ICE_MP_PORTS_PER_PF Number of ports per PF device (default: 8)
+#   ICE_MP_VFS_PER_PF  Number of VFs per PF device (default: 256)
+#   ICE_MP_VFS_PER_PORT Number of VFs per PF port (default: 32)
+#   ICE_MP_PORTS       Optional override for total PF ports (derived by default)
+#   ICE_MP_VFS         Optional override for total VFs (derived by default)
 #   ICE_MP_MEM         QEMU memory in MB (default: 2048)
 #   ICE_MP_CPUS        QEMU CPU count (default: 4)
 #   ICE_MP_NET_TAP     TAP device name (default: tap0)
@@ -73,10 +77,15 @@ LINUX_BUILD_DIR="$BUILD_DIR/linux"
 QEMU_BUILD_DIR="$BUILD_DIR/qemu"
 QEMU_BUILD_BINDIR="$QEMU_BUILD_DIR/build"
 
-QEMU_PORTS="${ICE_MP_PORTS:-4}"
-QEMU_VFS="${ICE_MP_VFS:-8}"
+QEMU_PF_DEVICES="${ICE_MP_PF_DEVICES:-8}"
+QEMU_PORTS_PER_DEVICE="${ICE_MP_PORTS_PER_PF:-8}"
+QEMU_VFS_PER_DEVICE="${ICE_MP_VFS_PER_PF:-256}"
+QEMU_VFS_PER_PORT="${ICE_MP_VFS_PER_PORT:-32}"
 QEMU_MEM="${ICE_MP_MEM:-2048}"
 QEMU_CPUS="${ICE_MP_CPUS:-4}"
+
+QEMU_PORTS=$((QEMU_PF_DEVICES * QEMU_PORTS_PER_DEVICE))
+QEMU_VFS=$((QEMU_PF_DEVICES * QEMU_VFS_PER_DEVICE))
 
 TAP_DEVICE="${ICE_MP_NET_TAP:-tap0}"
 TAP_IP="${ICE_MP_NET_IP:-192.168.100.1}"
@@ -85,8 +94,14 @@ TEST_TIMEOUT="${ICE_MP_TIMEOUT:-300}"
 
 # Logging
 QEMU_LOG="/tmp/ice_mp_qemu_serial.log"
+QEMU_STDERR_LOG="/tmp/ice_mp_qemu_stderr.log"
+QEMU_QMP_SOCK="/tmp/ice_mp_qmp.sock"
 QEMU_PID_FILE="/tmp/ice_mp_qemu.pid"
 TEST_RESULTS="/tmp/ice_mp_test_results.txt"
+VERIFY_VF_LINK_PROPAGATION="${ICE_MP_VERIFY_VF_LINK_PROPAGATION:-1}"
+
+LINK_PROP_TEST_TRIGGERED=0
+LINK_PROP_TEST_PORT=0
 
 # Color codes
 RED='\033[0;31m'
@@ -208,7 +223,7 @@ cleanup_old_artifacts() {
     fi
     
     # Remove old logs
-    rm -f "$QEMU_LOG" "$QEMU_PID_FILE" "$TEST_RESULTS"
+    rm -f "$QEMU_LOG" "$QEMU_STDERR_LOG" "$QEMU_QMP_SOCK" "$QEMU_PID_FILE" "$TEST_RESULTS"
     rm -f /tmp/ice_mp_*.log
     log_info "  Removed old logs"
     
@@ -297,6 +312,47 @@ generate_ddp_package() {
 
 show_help() {
     head -50 "$0" | grep "^# " | sed 's/^# //'
+}
+
+validate_topology() {
+    local expected_vfs_per_pf
+
+    if ! [[ "$QEMU_PF_DEVICES" =~ ^[0-9]+$ ]] || [ "$QEMU_PF_DEVICES" -le 0 ]; then
+        log_error "ICE_MP_PF_DEVICES must be a positive integer (current: $QEMU_PF_DEVICES)"
+        exit 1
+    fi
+
+    if ! [[ "$QEMU_PORTS_PER_DEVICE" =~ ^[0-9]+$ ]] || [ "$QEMU_PORTS_PER_DEVICE" -le 0 ]; then
+        log_error "ICE_MP_PORTS_PER_PF must be a positive integer (current: $QEMU_PORTS_PER_DEVICE)"
+        exit 1
+    fi
+
+    if ! [[ "$QEMU_VFS_PER_DEVICE" =~ ^[0-9]+$ ]] || [ "$QEMU_VFS_PER_DEVICE" -le 0 ]; then
+        log_error "ICE_MP_VFS_PER_PF must be a positive integer (current: $QEMU_VFS_PER_DEVICE)"
+        exit 1
+    fi
+
+    if ! [[ "$QEMU_VFS_PER_PORT" =~ ^[0-9]+$ ]] || [ "$QEMU_VFS_PER_PORT" -le 0 ]; then
+        log_error "ICE_MP_VFS_PER_PORT must be a positive integer (current: $QEMU_VFS_PER_PORT)"
+        exit 1
+    fi
+
+    expected_vfs_per_pf=$((QEMU_PORTS_PER_DEVICE * QEMU_VFS_PER_PORT))
+    if [ "$QEMU_VFS_PER_DEVICE" -ne "$expected_vfs_per_pf" ]; then
+        log_error "Topology mismatch: ICE_MP_VFS_PER_PF ($QEMU_VFS_PER_DEVICE) must equal ICE_MP_PORTS_PER_PF x ICE_MP_VFS_PER_PORT ($QEMU_PORTS_PER_DEVICE x $QEMU_VFS_PER_PORT = $expected_vfs_per_pf)"
+        exit 1
+    fi
+
+    if [ "$QEMU_PORTS_PER_DEVICE" -gt 16 ]; then
+        log_error "ICE_MP_PORTS_PER_PF must be <= 16 for current emulation limits (current: $QEMU_PORTS_PER_DEVICE)"
+        exit 1
+    fi
+
+    QEMU_PORTS=$((QEMU_PF_DEVICES * QEMU_PORTS_PER_DEVICE))
+    QEMU_VFS=$((QEMU_PF_DEVICES * QEMU_VFS_PER_DEVICE))
+
+    log_info "Topology target: ${QEMU_PF_DEVICES} PF device(s), ${QEMU_PORTS_PER_DEVICE} ports/PF, ${QEMU_VFS_PER_DEVICE} VFs/PF, ${QEMU_VFS_PER_PORT} VFs/port"
+    log_info "Derived totals: ${QEMU_PORTS} ports, ${QEMU_VFS} VFs"
 }
 
 ################################################################################
@@ -532,7 +588,11 @@ log "Network interfaces (PF only):"
 ip link show
 
 # Check if ICE devices are present
-ice_count=$(ip link show 2>/dev/null | grep -c "^[0-9]*: eth[0-3]:" 2>/dev/null || true)
+ice_count=$(for n in /sys/class/net/*; do \
+    [ -e "$n" ] || continue; \
+    drv=$(readlink -f "$n/device/driver" 2>/dev/null || true); \
+    [ "${drv##*/}" = "ice" ] && echo "${n##*/}"; \
+done | wc -l)
 ice_count=${ice_count:-0}
 log "Found $ice_count ICE PF network interfaces"
 
@@ -543,7 +603,7 @@ if [ "$EXPECTED_VFS" -gt 0 ] 2>/dev/null; then
     log "Waiting for $EXPECTED_VFS VF interfaces (iavf driver)..."
     VF_WAIT=0
     while [ "$VF_WAIT" -lt 90 ]; do
-        # Count all eth interfaces beyond eth0-eth3 (VF interfaces)
+        # Count all eth interfaces excluding ICE PF interfaces (VF interfaces)
         vf_count=$(ls -d /sys/class/net/eth* 2>/dev/null | wc -l)
         vf_count=$((vf_count - ice_count))
         if [ "$vf_count" -ge "$EXPECTED_VFS" ]; then
@@ -564,7 +624,11 @@ ip link show
 # Datapath test configuration injected by host script
 export ICE_MP_TEST_PEER_IP="__ICE_MP_TEST_PEER_IP__"
 export ICE_MP_TEST_GUEST_IP="__ICE_MP_TEST_GUEST_IP__"
+export ICE_MP_EXPECTED_PORTS="__ICE_MP_EXPECTED_PORTS__"
 export ICE_MP_EXPECTED_VFS="__ICE_MP_EXPECTED_VFS__"
+export ICE_MP_EXPECTED_VFS_PER_PORT="__ICE_MP_EXPECTED_VFS_PER_PORT__"
+export ICE_MP_EXPECTED_PF_DEVICES="__ICE_MP_EXPECTED_PF_DEVICES__"
+export ICE_MP_EXPECTED_VFS_PER_PF="__ICE_MP_EXPECTED_VFS_PER_PF__"
 
 # Run test suite
 if [ -f /root/test_vf_and_link.sh ]; then
@@ -599,7 +663,11 @@ INITEOF
     sed -i \
         -e "s|__ICE_MP_TEST_PEER_IP__|192.168.100.100|g" \
         -e "s|__ICE_MP_TEST_GUEST_IP__|$GUEST_IP/24|g" \
+        -e "s|__ICE_MP_EXPECTED_PORTS__|$QEMU_PORTS|g" \
         -e "s|__ICE_MP_EXPECTED_VFS__|$QEMU_VFS|g" \
+        -e "s|__ICE_MP_EXPECTED_VFS_PER_PORT__|$QEMU_VFS_PER_PORT|g" \
+        -e "s|__ICE_MP_EXPECTED_PF_DEVICES__|$QEMU_PF_DEVICES|g" \
+        -e "s|__ICE_MP_EXPECTED_VFS_PER_PF__|$QEMU_VFS_PER_DEVICE|g" \
         "$rootfs_dir/init"
     
     chmod +x "$rootfs_dir/init"
@@ -617,13 +685,14 @@ INITEOF
 }
 
 setup_network() {
-    log_info "Setting up network for QEMU (all 4 ports)..."
+    log_info "Setting up network for QEMU (${QEMU_PORTS} PF ports)..."
     
-    # Create TAP device for each port (netdev0-3)
+    # Create TAP device for each port
     TAP_DEVICES=()
     TAP_IPS=()
     
-    for port in 0 1 2 3; do
+    local port
+    for ((port=0; port<QEMU_PORTS; port++)); do
         local tap_dev="tap_ice$port"
         local tap_ip="192.168.100.$((100 + port))"
         
@@ -652,7 +721,7 @@ setup_network() {
     done
     
     # Verify all TAP devices exist
-    for port in 0 1 2 3; do
+    for ((port=0; port<QEMU_PORTS; port++)); do
         if ! ip link show "${TAP_DEVICES[$port]}" > /dev/null 2>&1; then
             log_error "TAP device ${TAP_DEVICES[$port]} not available; datapath test cannot run"
             exit 1
@@ -662,18 +731,178 @@ setup_network() {
     # Enable IP forwarding
     sudo sysctl net.ipv4.ip_forward=1 > /dev/null 2>&1 || true
     
-    log_success "Network setup complete (4 TAP devices: ${TAP_DEVICES[*]})"
+    log_success "Network setup complete (${QEMU_PORTS} TAP devices: ${TAP_DEVICES[*]})"
 }
 
 cleanup_network() {
     log_info "Cleaning up network configuration..."
-    
-    for port in 0 1 2 3; do
+
+    local port
+    for ((port=0; port<QEMU_PORTS; port++)); do
         local tap_dev="tap_ice$port"
         if ip link show "$tap_dev" > /dev/null 2>&1; then
             sudo ip link del "$tap_dev" 2>/dev/null || log_warn "Failed to delete TAP device $tap_dev"
         fi
     done
+}
+
+run_pf_vf_link_propagation_test() {
+    local tap_dev="tap_ice${LINK_PROP_TEST_PORT}"
+    local down_pf_pat="ice-mp: Propagated PF port ${LINK_PROP_TEST_PORT} link DOWN to [1-9][0-9]* mapped VFs"
+    local up_pf_pat="ice-mp: Propagated PF port ${LINK_PROP_TEST_PORT} link UP to [1-9][0-9]* mapped VFs"
+    local attempt
+
+    propagation_markers_observed() {
+        [ -f "$QEMU_STDERR_LOG" ] &&
+        grep -Eq "$down_pf_pat" "$QEMU_STDERR_LOG" &&
+        grep -Eq "$up_pf_pat" "$QEMU_STDERR_LOG"
+    }
+
+    qmp_set_link_state() {
+        local net_id="$1"
+        local up_state="$2"
+        python3 - <<'PY' "$QEMU_QMP_SOCK" "$net_id" "$up_state"
+import json
+import socket
+import sys
+
+sock_path = sys.argv[1]
+net_id = sys.argv[2]
+up_state = sys.argv[3].lower() in ("1", "true", "yes", "on")
+
+def recv_msg(sock):
+    data = b""
+    while b"\n" not in data:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise RuntimeError("QMP socket closed")
+        data += chunk
+    line, _ = data.split(b"\n", 1)
+    return json.loads(line.decode("utf-8", errors="ignore"))
+
+def send_msg(sock, payload):
+    sock.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+    return recv_msg(sock)
+
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.settimeout(5)
+sock.connect(sock_path)
+
+recv_msg(sock)
+resp = send_msg(sock, {"execute": "qmp_capabilities"})
+if "error" in resp:
+    raise RuntimeError(f"qmp_capabilities failed: {resp}")
+
+resp = send_msg(sock, {
+    "execute": "set_link",
+    "arguments": {"name": net_id, "up": up_state}
+})
+if "error" in resp:
+    raise RuntimeError(f"set_link failed: {resp}")
+
+print("ok")
+PY
+    }
+
+    if [ -S "$QEMU_QMP_SOCK" ]; then
+        log_info "Running PF→VF link propagation trigger via QMP set_link (ice${LINK_PROP_TEST_PORT})"
+        for attempt in $(seq 1 12); do
+            if qmp_set_link_state "ice${LINK_PROP_TEST_PORT}" false 2>/dev/null; then
+                sleep 1
+                if qmp_set_link_state "ice${LINK_PROP_TEST_PORT}" true 2>/dev/null; then
+                    sleep 1
+                    LINK_PROP_TEST_TRIGGERED=1
+                    if propagation_markers_observed; then
+                        log_success "PF→VF link propagation trigger sent via QMP (markers observed, attempt ${attempt})"
+                        return 0
+                    fi
+                    sleep 3
+                    continue
+                fi
+            fi
+            break
+        done
+
+        if [ "$LINK_PROP_TEST_TRIGGERED" -eq 1 ] 2>/dev/null; then
+            log_warn "QMP link trigger sent but propagation markers not yet observed; falling back to TAP toggle retries"
+        fi
+        log_warn "QMP set_link trigger failed; falling back to TAP link toggle"
+    fi
+
+    if ! ip link show "$tap_dev" > /dev/null 2>&1; then
+        log_error "PF→VF link propagation test failed: TAP device $tap_dev not found"
+        return 1
+    fi
+
+    log_info "Running PF→VF link propagation trigger on host ($tap_dev down/up)"
+
+    for attempt in $(seq 1 12); do
+        if ! sudo ip link set "$tap_dev" down 2>/dev/null; then
+            log_error "PF→VF link propagation test failed: could not set $tap_dev down"
+            return 1
+        fi
+        sleep 1
+
+        if ! sudo ip link set "$tap_dev" up 2>/dev/null; then
+            log_error "PF→VF link propagation test failed: could not set $tap_dev up"
+            return 1
+        fi
+        sleep 1
+
+        LINK_PROP_TEST_TRIGGERED=1
+        if propagation_markers_observed; then
+            log_success "PF→VF link propagation trigger sent on $tap_dev (markers observed, attempt ${attempt})"
+            return 0
+        fi
+
+        sleep 3
+    done
+
+    log_error "PF→VF link propagation test failed: trigger attempts completed without mapped-VF DOWN/UP markers"
+    log_info "Searched in: $QEMU_STDERR_LOG"
+    log_info "Expected markers:"
+    log_info "  $down_pf_pat"
+    log_info "  $up_pf_pat"
+    return 1
+}
+
+validate_pf_vf_link_propagation_logs() {
+    local down_link_pat='ice-mp: link_status_changed port=[0-9]+ link_up=0'
+    local down_pf_pat='ice-mp: Propagated PF port [0-9]+ link DOWN to [1-9][0-9]* mapped VFs'
+    local up_link_pat='ice-mp: link_status_changed port=[0-9]+ link_up=1'
+    local up_pf_pat='ice-mp: Propagated PF port [0-9]+ link UP to [1-9][0-9]* mapped VFs'
+
+    if [ "$VERIFY_VF_LINK_PROPAGATION" -ne 1 ] 2>/dev/null; then
+        log_info "Skipping PF→VF link propagation validation (ICE_MP_VERIFY_VF_LINK_PROPAGATION=$VERIFY_VF_LINK_PROPAGATION)"
+        return 0
+    fi
+
+    if [ "$LINK_PROP_TEST_TRIGGERED" -ne 1 ] 2>/dev/null; then
+        log_error "PF→VF link propagation validation failed: trigger was not executed"
+        return 1
+    fi
+
+    if [ ! -f "$QEMU_STDERR_LOG" ]; then
+        log_error "PF→VF link propagation validation failed: $QEMU_STDERR_LOG not found"
+        return 1
+    fi
+
+    if grep -Eq "$down_link_pat" "$QEMU_STDERR_LOG" &&
+       grep -Eq "$down_pf_pat" "$QEMU_STDERR_LOG" &&
+       grep -Eq "$up_link_pat" "$QEMU_STDERR_LOG" &&
+       grep -Eq "$up_pf_pat" "$QEMU_STDERR_LOG"; then
+        log_success "PF→VF link propagation validated (DOWN/UP observed in QEMU logs)"
+        return 0
+    fi
+
+    log_error "PF→VF link propagation validation failed: expected DOWN/UP propagation markers not found"
+    log_info "Searched in: $QEMU_STDERR_LOG"
+    log_info "Expected patterns:"
+    log_info "  $down_link_pat"
+    log_info "  $down_pf_pat"
+    log_info "  $up_link_pat"
+    log_info "  $up_pf_pat"
+    return 1
 }
 
 ################################################################################
@@ -693,20 +922,41 @@ boot_qemu() {
         "-machine" "q35"
         "-kernel" "$KERNEL_PATH"
         "-initrd" "$ROOTFS_PATH"
-        "-netdev" "tap,id=ice0,ifname=tap_ice0,script=no,downscript=no"
-        "-netdev" "tap,id=ice1,ifname=tap_ice1,script=no,downscript=no"
-        "-netdev" "tap,id=ice2,ifname=tap_ice2,script=no,downscript=no"
-        "-netdev" "tap,id=ice3,ifname=tap_ice3,script=no,downscript=no"
-        "-device" "pcie-root-port,id=rp1,slot=2,chassis=1"
-        "-device" "pci-ice-mp,bus=rp1,ports=$QEMU_PORTS,vfs=$QEMU_VFS,netdev0=ice0,netdev1=ice1,netdev2=ice2,netdev3=ice3"
         "-m" "$QEMU_MEM"
         "-smp" "$QEMU_CPUS"
         "-nographic"
         "-monitor" "none"
+        "-qmp" "unix:${QEMU_QMP_SOCK},server=on,wait=off"
         "-serial" "file:$QEMU_LOG"
         "-append" "root=/dev/ram console=ttyS0"
         "-no-reboot"
     )
+
+    local port
+    for ((port=0; port<QEMU_PORTS; port++)); do
+        qemu_cmd+=("-netdev" "tap,id=ice${port},ifname=tap_ice${port},script=no,downscript=no")
+    done
+
+    local pf_idx
+    local netdev_idx
+    local root_slot
+    local rp_id
+    local device_opts
+    local mac_octet
+    for ((pf_idx=0; pf_idx<QEMU_PF_DEVICES; pf_idx++)); do
+        root_slot=$((2 + pf_idx))
+        rp_id="rp$((pf_idx + 1))"
+        qemu_cmd+=("-device" "pcie-root-port,id=${rp_id},slot=${root_slot},chassis=$((pf_idx + 1)),bus-reserve=32,mem-reserve=64M,pref64-reserve=512M")
+
+        device_opts="pci-ice-mp,bus=${rp_id},ports=$QEMU_PORTS_PER_DEVICE,vfs=$QEMU_VFS_PER_DEVICE"
+        for ((port=0; port<QEMU_PORTS_PER_DEVICE; port++)); do
+            netdev_idx=$((pf_idx * QEMU_PORTS_PER_DEVICE + port))
+            device_opts+=",netdev${port}=ice${netdev_idx}"
+            printf -v mac_octet "%02x" $((0x56 + netdev_idx))
+            device_opts+=",mac${port}=52:54:00:12:34:${mac_octet}"
+        done
+        qemu_cmd+=("-device" "$device_opts")
+    done
     
     # Additional QEMU options for better performance
     # Try to use KVM if available, otherwise fall back to TCG
@@ -722,14 +972,16 @@ boot_qemu() {
         )
     fi
     
-    # Clear previous QEMU log
+    # Clear previous QEMU logs
     rm -f "$QEMU_LOG"
+    rm -f "$QEMU_STDERR_LOG"
+    rm -f "$QEMU_QMP_SOCK"
     
     log_info "QEMU command:"
     log_info "${qemu_cmd[*]}"
     
     # Launch QEMU in background (output goes directly to serial file)
-    "${qemu_cmd[@]}" 2>/tmp/ice_mp_qemu_stderr.log &
+    "${qemu_cmd[@]}" 2>"$QEMU_STDERR_LOG" &
     local qemu_pid=$!
     echo "$qemu_pid" > "$QEMU_PID_FILE"
     
@@ -749,7 +1001,27 @@ boot_qemu() {
     
     # Wait for QEMU to finish or timeout
     local elapsed=0
+    local propagation_attempted=0
+    local propagation_gate_seen=0
     while [ $elapsed -lt "$TEST_TIMEOUT" ]; do
+        if [ "$VERIFY_VF_LINK_PROPAGATION" -eq 1 ] 2>/dev/null && [ $propagation_attempted -eq 0 ]; then
+            if [ -f "$QEMU_LOG" ] && grep -q "Section 3: SR-IOV Configuration" "$QEMU_LOG"; then
+                propagation_gate_seen=1
+                if run_pf_vf_link_propagation_test; then
+                    propagation_attempted=1
+                else
+                    propagation_attempted=1
+                fi
+            elif [ $elapsed -ge 120 ] && [ $propagation_gate_seen -eq 0 ]; then
+                log_warn "SR-IOV section marker not seen by 120s; triggering PF→VF propagation test anyway"
+                if run_pf_vf_link_propagation_test; then
+                    propagation_attempted=1
+                else
+                    propagation_attempted=1
+                fi
+            fi
+        fi
+
         if ! kill -0 "$qemu_pid" 2>/dev/null; then
             log_success "QEMU test execution completed"
             break
@@ -771,6 +1043,8 @@ boot_qemu() {
 
 collect_test_results() {
     log_info "Collecting test results..."
+    local guest_result=1
+    local propagation_result=0
     
     if [ ! -f "$QEMU_LOG" ]; then
         log_error "QEMU serial log not found"
@@ -782,17 +1056,27 @@ collect_test_results() {
     cat "$QEMU_LOG"
     log_info "=============================================="
     
-    # Parse and summarize results
+    # Parse and summarize guest test results
     if grep -q "All tests passed" "$QEMU_LOG"; then
         log_success "All tests PASSED!"
-        return 0
+        guest_result=0
     elif grep -q "Pass Rate:" "$QEMU_LOG"; then
         log_warn "Some tests may have failed. Check output above."
-        return 1
+        guest_result=1
     else
         log_error "Test results not found in QEMU log - tests may not have completed"
-        return 1
+        guest_result=1
     fi
+
+    if ! validate_pf_vf_link_propagation_logs; then
+        propagation_result=1
+    fi
+
+    if [ "$guest_result" -eq 0 ] && [ "$propagation_result" -eq 0 ]; then
+        return 0
+    fi
+
+    return 1
 }
 
 ################################################################################
@@ -839,6 +1123,9 @@ main() {
         esac
     done
     
+    # Check topology variables and prerequisites
+    validate_topology
+
     # Check prerequisites
     check_prerequisites
     
@@ -857,7 +1144,8 @@ main() {
     log_info "Kernel: $KERNEL_PATH"
     log_info "Rootfs: $ROOTFS_PATH"
     log_info "DDP Package: $DDP_PATH"
-    log_info "QEMU Ports: $QEMU_PORTS, VFs: $QEMU_VFS"
+    log_info "Topology: PF devices=$QEMU_PF_DEVICES, ports/PF=$QEMU_PORTS_PER_DEVICE, VFs/PF=$QEMU_VFS_PER_DEVICE, VFs/port=$QEMU_VFS_PER_PORT"
+    log_info "Totals: ports=$QEMU_PORTS, VFs=$QEMU_VFS"
     log_info "Memory: ${QEMU_MEM}MB, CPUs: $QEMU_CPUS"
     log_info "======================================================="
     
@@ -866,7 +1154,7 @@ main() {
         cleanup_old_artifacts
     else
         # Just clean logs and stray processes
-        rm -f "$QEMU_LOG" "$QEMU_PID_FILE" "$TEST_RESULTS"
+        rm -f "$QEMU_LOG" "$QEMU_STDERR_LOG" "$QEMU_QMP_SOCK" "$QEMU_PID_FILE" "$TEST_RESULTS"
         if pgrep -f "qemu-system.*ice-mp" > /dev/null 2>&1; then
             pkill -9 -f "qemu-system.*ice-mp"
             sleep 1
@@ -941,7 +1229,7 @@ main() {
         cleanup_network
     fi
     
-    log_info "Logs preserved at: $QEMU_LOG, /tmp/ice_mp_qemu_stderr.log"
+    log_info "Logs preserved at: $QEMU_LOG, $QEMU_STDERR_LOG"
     log_success "Test script completed"
 }
 

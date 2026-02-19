@@ -7,8 +7,8 @@ Intel ICE Multi-Port Physical Function (PF) Emulator for QEMU
 This project provides a complete QEMU device emulation for the Intel Ethernet 800 Series (ICE) network adapter with multi-port Physical Function support. It enables testing and development of the Linux ICE driver's multi-port capabilities in a virtual environment.
 
 **Key Features:**
-- 4-port Physical Function emulation
-- SR-IOV support (8 Virtual Functions)
+- 8 PF devices × 8 ports/PF emulation (64 total PF ports)
+- SR-IOV support (256 VFs/PF, 32 VFs/port)
 - Full AdminQ command handling
 - Per-port MSI-X interrupt routing
 - TX/RX datapath with ARP/ICMP loopback
@@ -61,6 +61,25 @@ Tests Failed:        0
 
 Pass Rate:           100% (47/47)
 ✓ All tests passed! Driver is production-ready.
+```
+
+### Latest Validation Evidence (2026-02-19)
+
+Fresh end-to-end rerun with PF→VF propagation validation enabled:
+
+```bash
+sudo -E env ICE_MP_TIMEOUT=1200 ICE_MP_VERIFY_VF_LINK_PROPAGATION=1 bash tools/run_ice_mp_test.sh --skip-build
+```
+
+Observed pass markers:
+
+```text
+Terminal exit code: 0
+Total Test Cases:    54
+Tests Passed:        54
+Tests Failed:        0
+Pass Rate:           100% (54/54)
+PF→VF link propagation validated (DOWN/UP observed in QEMU logs)
 ```
 
 ### All Log Files
@@ -125,11 +144,17 @@ sudo bash tools/run_ice_mp_test.sh --clean
 Customize the test environment:
 
 ```bash
-# Number of ports (default: 4)
-export ICE_MP_PORTS=4
+# Number of PF devices (default: 8)
+export ICE_MP_PF_DEVICES=8
 
-# Number of VFs per port (default: 2, max: 8 total)
-export ICE_MP_VFS=2
+# Number of ports per PF device (default: 8)
+export ICE_MP_PORTS_PER_PF=8
+
+# Number of VFs per PF device (default: 256)
+export ICE_MP_VFS_PER_PF=256
+
+# Number of VFs per PF port (default: 32)
+export ICE_MP_VFS_PER_PORT=32
 
 # VM memory in MB (default: 2048)
 export ICE_MP_MEM=2048
@@ -146,7 +171,7 @@ export ICE_MP_KVM=1
 The test suite validates 47 different aspects across 13 categories:
 
 ### 1. **Device Enumeration** (5 tests)
-- PCI device detection for 4 PF ports
+- PCI device detection for 64 PF ports
 - SR-IOV VF enumeration
 
 ### 2. **Driver Loading** (4 tests)
@@ -155,7 +180,7 @@ The test suite validates 47 different aspects across 13 categories:
 - MSI-X vector allocation
 
 ### 3. **Network Interface** (8 tests)
-- Interface creation for all 4 ports
+- Interface creation for all 64 PF ports
 - MAC address assignment
 - Link state detection
 - Interface up/down operations
@@ -190,7 +215,7 @@ The test suite validates 47 different aspects across 13 categories:
 - TX queue configuration
 - RX queue configuration
 - ARP/ICMP loopback testing
-- Ping connectivity on all 4 ports
+- Ping connectivity on all 64 PF ports
 
 ### 10. **Link Management** (2 tests)
 - Link speed detection
@@ -231,9 +256,9 @@ sudo apt-get install -y build-essential meson ninja-build \
 
 ### QEMU Device (`build/qemu/hw/net/pci-ice-mp.c`)
 - **PCI Device ID:** 8086:1592 (Intel E810-C QSFP - **Production Device**)
-- **Ports:** 4 independent network functions
-- **VFs:** Up to 8 total across all ports
-- **MSI-X:** 64 vectors with per-port routing
+- **Topology:** 8 PF devices × 8 ports/PF (64 total PF ports)
+- **VFs:** 256 per PF device (2048 total), 32 per PF port
+- **MSI-X:** Expanded vectors for SR-IOV-heavy per-port routing
 - **MMIO:** 32MB BAR0 for registers
 - **AdminQ:** Full command set implementation (0x06EA for multi-port detection)
 - **Datapath:** TX/RX ring buffers with ARP/ICMP responder

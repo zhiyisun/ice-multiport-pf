@@ -174,6 +174,7 @@ Each `net_device` will have a predictable name (e.g., based on `dev_port` or `ph
 ### 5.7. Link Events and PHY Handling
 
 -   **Proposed:** AEQ events will be tagged by `lport`, and a shared misc IRQ will dispatch them to the appropriate `net_device` based on a port index. PHY commands will include an `lport` parameter.
+-   **SR-IOV Link Propagation:** When a PF port transitions link down/up, the same transition is propagated to all VFs mapped to that port (`vf->port_id == lport`) via VF link-change notifications, ensuring PF/VF carrier-state consistency per port.
 -   **E810 Reality:** A per-PF AEQ/misc IRQ is used without tagging or demultiplexing, and updates are applied directly to the single `net_device`.
 
 ### 5.8. Reset and Recovery

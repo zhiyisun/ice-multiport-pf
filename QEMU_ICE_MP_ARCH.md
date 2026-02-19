@@ -204,6 +204,7 @@ The driver's event handling logic is exercised through a simple doorbell mechani
 *   The QEMU device exposes 1 PF and a configurable number of VFs.
 *   Each VF determines its parent port by reading its entry in the `VF_PORT_MAP` array (`VF_PORT_MAP[vf_id]`).
 *   The driver leverages this mapping for VF initialization, mailbox routing, and enforcing per-port resource limits.
+*   PF port link transitions are propagated to mapped VFs: when a PF port goes down/up, QEMU posts `VIRTCHNL_EVENT_LINK_CHANGE` down/up events to all VFs mapped to that port.
 *   This mechanism validates the driver's logic for per-port VF isolation.
 
 ## 9. Reset and Recovery
@@ -223,10 +224,12 @@ This flow ensures the driver's multi-port reset handling is robust.
     ```
 3.  **Driver Probe Verification:** Confirm that the driver probes successfully, discovers all 4 configured ports, and registers 4 distinct `net_device` instances.
 4.  **Event Simulation:** Use QEMU to inject events (e.g., link changes, VF mailbox messages, resets) by writing to `BAR0` and triggering MSI-X interrupts.
+    *   For PF→VF propagation validation, toggle host TAP for a mapped port (for example `tap_ice0` down/up) while guest SR-IOV is active and verify `LINK_CHANGE` down/up is posted to mapped VFs.
 5.  **Validation:**
     *   Verify multi-port `net_device` registration.
     *   Confirm correct event demultiplexing to the right port.
     *   Validate VF-to-port mapping and resource allocation.
+    *   Validate PF port down/up propagates to mapped VF link state changes.
     *   Check `devlink` and `sysfs` output for correct multi-port representation.
     *   Ensure the driver handles a full device reset correctly.
 
@@ -302,6 +305,13 @@ This diagram illustrates the separation of concerns between the Linux guest driv
 1.  **QEMU:** Writes `{ port_id=1, event_type=LINK_CHANGE }` to `BAR0.EVENT_DOORBELL`.
 2.  **QEMU:** Triggers MSI-X vector 0.
 3.  **Driver (ISR):** Reads `EVENT_DOORBELL`, demuxes by `port_id=1`, and updates the carrier state for the corresponding Port 1 `net_device`.
+
+**PF Port Down → Mapped VF Link Down:**
+1.  **Host/QEMU Net Layer:** Host toggles the mapped TAP (`tap_iceX`) down.
+2.  **QEMU (`pci-ice-mp`):** Updates PF port status and emits a PF `LINK_CHANGE` event.
+3.  **QEMU (`pci-ice-mp`):** Iterates `VF_PORT_MAP`, finds VFs mapped to that `port_id`, and posts `VIRTCHNL_EVENT_LINK_CHANGE` with link down to each mapped VF.
+4.  **Guest VF Driver:** Receives VF link change event and reflects VF link-down state.
+5.  **Recovery:** TAP up causes the symmetric link-up propagation path.
 
 **VF Mailbox Message:**
 1.  **QEMU:** Writes `{ port_id=2, event_type=VF_MAILBOX }` to `BAR0.EVENT_DOORBELL`.
