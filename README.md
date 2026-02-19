@@ -12,7 +12,7 @@ This project provides a complete QEMU device emulation for the Intel Ethernet 80
 - Full AdminQ command handling
 - Per-port MSI-X interrupt routing
 - TX/RX datapath with ARP/ICMP loopback
-- Complete test suite (47 test cases, 100% pass rate)
+- Complete test suite (54 test cases, 100% pass rate)
 - Production device ID: Intel E810-C (0x1592)
 
 ## Quick Start
@@ -29,7 +29,7 @@ This single command will:
 3. Build QEMU with the custom ICE multi-port device
 4. Generate DDP firmware package
 5. Create a minimal rootfs with test scripts
-6. Boot the VM and run all 47 tests
+6. Boot the VM and run all 54 tests
 7. Display results
 
 **Typical runtime:** 10-15 minutes on a modern system with KVM acceleration.
@@ -55,11 +55,11 @@ Test Results Summary
 ═══════════════════════════════════════════════════════
 
 Total Test Sections: 21
-Total Test Cases:    47
-Tests Passed:        47
+Total Test Cases:    54
+Tests Passed:        54
 Tests Failed:        0
 
-Pass Rate:           100% (47/47)
+Pass Rate:           100% (54/54)
 ✓ All tests passed! Driver is production-ready.
 ```
 
