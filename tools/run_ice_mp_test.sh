@@ -19,9 +19,11 @@
 # Options:
 #   --kernel-only      Only build the kernel, don't run tests
 #   --skip-build       Skip all builds (QEMU, DDP, rootfs, kernel), use existing artifacts
+#   --skip-linux-build Skip Linux kernel build, rebuild rootfs and DDP only
 #   --skip-qemu-build  Skip QEMU build, use existing binary
 #   --skip-test        Skip running tests after boot
 #   --keep-vm          Keep VM running after test (for debugging)
+#   --interactive      Launch VM and drop into guest shell after setup
 #   --clean            Clean all generated artifacts (logs, builds, images) and exit
 #   --help             Show this help message
 #
@@ -36,8 +38,8 @@
 #   ICE_MP_VFS_PER_PORT Number of VFs per PF port (default: 32)
 #   ICE_MP_PORTS       Optional override for total PF ports (derived by default)
 #   ICE_MP_VFS         Optional override for total VFs (derived by default)
-#   ICE_MP_MEM         QEMU memory in MB (default: 2048)
-#   ICE_MP_CPUS        QEMU CPU count (default: 4)
+#   ICE_MP_MEM         QEMU memory in MB (default: 8192)
+#   ICE_MP_CPUS        QEMU CPU count (default: 32)
 #   ICE_MP_NET_TAP     TAP device name (default: tap0)
 #   ICE_MP_NET_IP      TAP device IP (default: 192.168.100.1)
 #   ICE_MP_GUEST_IP    Guest IP (default: 192.168.100.2)
@@ -63,10 +65,12 @@ done
 # Default configuration
 KERNEL_ONLY=0
 SKIP_BUILD=0
+SKIP_LINUX_BUILD=0
 SKIP_QEMU_BUILD=0
 SKIP_TEST=0
 KEEP_VM=0
 CLEAN_ONLY=0
+INTERACTIVE_MODE=0
 HELP=0
 
 QEMU_BIN="${ICE_MP_QEMU_BIN:-$BUILD_DIR/qemu/build/qemu-system-x86_64}"
@@ -81,8 +85,8 @@ QEMU_PF_DEVICES="${ICE_MP_PF_DEVICES:-8}"
 QEMU_PORTS_PER_DEVICE="${ICE_MP_PORTS_PER_PF:-8}"
 QEMU_VFS_PER_DEVICE="${ICE_MP_VFS_PER_PF:-256}"
 QEMU_VFS_PER_PORT="${ICE_MP_VFS_PER_PORT:-32}"
-QEMU_MEM="${ICE_MP_MEM:-2048}"
-QEMU_CPUS="${ICE_MP_CPUS:-4}"
+QEMU_MEM="${ICE_MP_MEM:-8192}"
+QEMU_CPUS="${ICE_MP_CPUS:-32}"
 
 QEMU_PORTS=$((QEMU_PF_DEVICES * QEMU_PORTS_PER_DEVICE))
 QEMU_VFS=$((QEMU_PF_DEVICES * QEMU_VFS_PER_DEVICE))
@@ -204,8 +208,8 @@ cleanup_old_artifacts() {
         log_info "  Removed old rootfs"
     fi
     
-    # Remove old kernel image
-    if [ -f "$KERNEL_PATH" ]; then
+    # Remove old kernel image (only if not skipping Linux build)
+    if [ $SKIP_LINUX_BUILD -eq 0 ] && [ -f "$KERNEL_PATH" ]; then
         rm -f "$KERNEL_PATH"
         log_info "  Removed old kernel image"
     fi
@@ -630,6 +634,251 @@ export ICE_MP_EXPECTED_VFS_PER_PORT="__ICE_MP_EXPECTED_VFS_PER_PORT__"
 export ICE_MP_EXPECTED_PF_DEVICES="__ICE_MP_EXPECTED_PF_DEVICES__"
 export ICE_MP_EXPECTED_VFS_PER_PF="__ICE_MP_EXPECTED_VFS_PER_PF__"
 
+INTERACTIVE_MODE="__ICE_MP_INTERACTIVE_MODE__"
+if [ "$INTERACTIVE_MODE" = "1" ]; then
+    log "Interactive mode: auto-configuring SR-IOV before shell handoff"
+
+    # Bring up all PF ports
+    for n in /sys/class/net/*; do
+        [ -e "$n" ] || continue
+        drv=$(readlink -f "$n/device/driver" 2>/dev/null || true)
+        if [ "${drv##*/}" = "ice" ]; then
+            ifname="${n##*/}"
+            ip link set "$ifname" up 2>/dev/null || true
+        fi
+    done
+
+    # Enable SR-IOV VFs on each PF device
+    EXPECTED_VFS_PER_PF="__ICE_MP_EXPECTED_VFS_PER_PF__"
+    for pf in /sys/bus/pci/drivers/ice/*:*; do
+        [ -f "$pf/sriov_numvfs" ] || continue
+        cur=$(cat "$pf/sriov_numvfs" 2>/dev/null)
+        if [ "$cur" != "$EXPECTED_VFS_PER_PF" ] 2>/dev/null; then
+            echo "$EXPECTED_VFS_PER_PF" > "$pf/sriov_numvfs" 2>/dev/null || true
+        fi
+    done
+
+    # Count enabled VFs
+    total_vfs=0
+    for pf in /sys/bus/pci/drivers/ice/*:*; do
+        [ -f "$pf/sriov_numvfs" ] || continue
+        cur=$(cat "$pf/sriov_numvfs" 2>/dev/null)
+        total_vfs=$((total_vfs + ${cur:-0}))
+    done
+    log "Enabled SR-IOV VFs: $total_vfs"
+
+    # Wait for VF interfaces (iavf probing)
+    EXPECTED_VFS_TOTAL="__ICE_MP_EXPECTED_VFS__"
+    if [ "$EXPECTED_VFS_TOTAL" -gt 0 ] 2>/dev/null; then
+        log "Waiting for VF interfaces (iavf driver)..."
+        waited=0
+        max_wait=300
+        prev_count=0
+        stall_count=0
+        while [ "$waited" -lt "$max_wait" ]; do
+            vf_count=0
+            for n in /sys/class/net/*; do
+                [ -e "$n" ] || continue
+                drv=$(readlink -f "$n/device/driver" 2>/dev/null || true)
+                [ "${drv##*/}" = "iavf" ] && vf_count=$((vf_count + 1))
+            done
+            if [ "$vf_count" -ge "$EXPECTED_VFS_TOTAL" ]; then
+                log "All $vf_count/$EXPECTED_VFS_TOTAL VF interfaces ready"
+                break
+            fi
+            # Detect stall: if no new VFs for 30s, stop waiting
+            if [ "$vf_count" -eq "$prev_count" ]; then
+                stall_count=$((stall_count + 1))
+            else
+                stall_count=0
+                prev_count=$vf_count
+            fi
+            if [ "$stall_count" -ge 30 ] && [ "$vf_count" -gt 0 ]; then
+                log "VF probe stabilized at $vf_count/$EXPECTED_VFS_TOTAL (no new VFs for 30s)"
+                break
+            fi
+            if [ $((waited % 30)) -eq 0 ]; then
+                log "VF probe progress: $vf_count/$EXPECTED_VFS_TOTAL (waited ${waited}s)"
+            fi
+            sleep 1
+            waited=$((waited + 1))
+        done
+        if [ "$waited" -ge "$max_wait" ]; then
+            log "VF wait timed out after ${max_wait}s ($vf_count/$EXPECTED_VFS_TOTAL ready)"
+        fi
+    fi
+
+    # ================================================================
+    # Assign IP addresses to all interfaces
+    # Scheme: each PF port gets subnet 10.0.{global_port}.0/24
+    #   Host TAP:  10.0.{global_port}.1
+    #   Guest PF:  10.0.{global_port}.2
+    #   Guest VFs: 10.0.{global_port}.{10 + vf_local_idx}
+    # ================================================================
+    PORTS_PER_PF="__ICE_MP_PORTS_PER_PF__"
+    PF_DEVICES="__ICE_MP_EXPECTED_PF_DEVICES__"
+    VFS_PER_PF="__ICE_MP_EXPECTED_VFS_PER_PF__"
+    TOTAL_PORTS=$((PF_DEVICES * PORTS_PER_PF))
+
+    log "Assigning IP addresses (${PF_DEVICES} PFs x ${PORTS_PER_PF} ports, ${VFS_PER_PF} VFs/PF)..."
+
+    # Build ordered list of PF interfaces (ice driver), sorted by PCI BDF
+    pf_ifaces=""
+    for n in /sys/class/net/*; do
+        [ -e "$n" ] || continue
+        drv=$(readlink -f "$n/device/driver" 2>/dev/null || true)
+        if [ "${drv##*/}" = "ice" ]; then
+            bdf=$(readlink -f "$n/device" 2>/dev/null || true)
+            bdf=${bdf##*/}
+            ifname="${n##*/}"
+            num="${ifname#eth}"
+            echo "$bdf $ifname $num"
+        fi
+    done | sort -k1,1 -k3,3n | awk '{print $1, $2}' > /tmp/pf_list.txt
+
+    # Assign IPs to PF interfaces
+    # PF interfaces are ordered by BDF; within each PF device, ports are sequential
+    pf_port_idx=0
+    while read -r bdf ifname; do
+        if [ "$pf_port_idx" -ge "$TOTAL_PORTS" ]; then
+            break
+        fi
+        global_port=$pf_port_idx
+        ip addr add "10.0.${global_port}.2/24" dev "$ifname" 2>/dev/null || true
+        ip link set "$ifname" up 2>/dev/null || true
+        pf_port_idx=$((pf_port_idx + 1))
+    done < /tmp/pf_list.txt
+    log "Assigned IPs to $pf_port_idx PF port interfaces"
+
+    # Build ordered list of VF interfaces (iavf driver), sorted by PCI BDF
+    for n in /sys/class/net/*; do
+        [ -e "$n" ] || continue
+        drv=$(readlink -f "$n/device/driver" 2>/dev/null || true)
+        if [ "${drv##*/}" = "iavf" ]; then
+            bdf=$(readlink -f "$n/device" 2>/dev/null || true)
+            bdf=${bdf##*/}
+            ifname="${n##*/}"
+            num="${ifname#eth}"
+            echo "$bdf $ifname $num"
+        fi
+    done | sort -k1,1 -k3,3n | awk '{print $1, $2}' > /tmp/vf_list.txt
+
+    # Assign IPs to VF interfaces
+    # VFs are distributed round-robin across ports within each PF:
+    #   VF i on PF j -> port = (i % PORTS_PER_PF)
+    #   global_port = j * PORTS_PER_PF + (i % PORTS_PER_PF)
+    # We track per-port VF counters to assign unique .{10+N} addresses
+    # Initialize per-port VF counters
+    port_idx=0
+    while [ "$port_idx" -lt "$TOTAL_PORTS" ]; do
+        eval "vf_counter_${port_idx}=0"
+        port_idx=$((port_idx + 1))
+    done
+
+    vf_assigned=0
+    # Group VFs by parent PF device (bus number)
+    # VFs on bus XX belong to PF device whose root port created that bus
+    # With sorted BDF, VFs naturally group by PF (bus number increases per PF)
+    current_pf_idx=0
+    current_bus=""
+    vf_within_pf=0
+    while read -r bdf ifname; do
+        # Extract bus from BDF (format: DDDD:BB:DD.F)
+        bus=$(echo "$bdf" | cut -d: -f2)
+        if [ -z "$current_bus" ]; then
+            current_bus="$bus"
+        elif [ "$bus" != "$current_bus" ]; then
+            current_pf_idx=$((current_pf_idx + 1))
+            current_bus="$bus"
+            vf_within_pf=0
+        fi
+
+        local_port=$((vf_within_pf % PORTS_PER_PF))
+        global_port=$((current_pf_idx * PORTS_PER_PF + local_port))
+
+        if [ "$global_port" -lt "$TOTAL_PORTS" ]; then
+            eval "cnt=\$vf_counter_${global_port}"
+            host_part=$((10 + cnt))
+            if [ "$host_part" -le 254 ]; then
+                ip addr add "10.0.${global_port}.${host_part}/24" dev "$ifname" 2>/dev/null || true
+                ip link set "$ifname" up 2>/dev/null || true
+                eval "vf_counter_${global_port}=$((cnt + 1))"
+                vf_assigned=$((vf_assigned + 1))
+            fi
+        fi
+        vf_within_pf=$((vf_within_pf + 1))
+    done < /tmp/vf_list.txt
+    log "Assigned IPs to $vf_assigned VF interfaces"
+
+    # Print IP summary for first few ports
+    log "===== IP Address Summary ====="
+    log "Scheme: each PF port N -> subnet 10.0.N.0/24"
+    log "  Host TAP (tap_iceN):  10.0.N.1"
+    log "  Guest PF port:        10.0.N.2"
+    log "  Guest VFs:            10.0.N.{10,11,...}"
+    log ""
+    port_idx=0
+    while [ "$port_idx" -lt "$TOTAL_PORTS" ] && [ "$port_idx" -lt 4 ]; do
+        eval "cnt=\$vf_counter_${port_idx}"
+        log "  Port $port_idx: PF=10.0.${port_idx}.2, TAP=10.0.${port_idx}.1, VFs=$cnt (10.0.${port_idx}.10-$((10+cnt-1)))"
+        port_idx=$((port_idx + 1))
+    done
+    if [ "$TOTAL_PORTS" -gt 4 ]; then
+        log "  ... ($((TOTAL_PORTS - 4)) more ports)"
+    fi
+    log ""
+    log "Try: ping -c1 10.0.0.1   (ping host TAP for port 0 from guest)"
+    log ""
+
+    log "===== Interactive Shell Ready ====="
+    log "PF interfaces: $pf_port_idx | VF interfaces: $vf_assigned"
+    log ""
+    log "--- Network Topology ---"
+    log "Each PF port N uses subnet 10.0.N.0/24:"
+    log "  Host TAP (tap_iceN):    10.0.N.1   <-- host side of the bridge"
+    log "  Guest PF port (ethX):   10.0.N.2   <-- PF network interface"
+    log "  Guest VFs (ethY):       10.0.N.10, 10.0.N.11, ...  <-- VF interfaces"
+    log ""
+    log "Port mapping: 8 PFs x 8 ports = 64 ports (port 0..63)"
+    log "VF mapping:   VFs are distributed round-robin across ports"
+    log "              vf_local_idx % $PORTS_PER_PF -> port within that PF"
+    log ""
+    log "--- Ping Examples ---"
+    log "From guest PF port 0 to host:"
+    log "  ping -c3 10.0.0.1"
+    log "From guest VF on port 0 to host (use -I to specify VF interface):"
+    log "  ping -c3 10.0.0.1 -I eth64"
+    log "From host to guest PF port 0:"
+    log "  ping -c3 10.0.0.2  (run on host terminal)"
+    log "From host to guest VF on port 0:"
+    log "  ping -c3 10.0.0.10  (run on host terminal)"
+    log ""
+    log "--- Useful Commands ---"
+    log "  ip -4 addr show          -- show all assigned IPs"
+    log "  ip link show <iface>     -- show MAC/state of an interface"
+    log "  cat /tmp/pf_list.txt     -- list PF BDF -> interface mappings"
+    log "  cat /tmp/vf_list.txt     -- list VF BDF -> interface mappings"
+    log "  lspci | grep Ethernet    -- show all ICE PCI devices"
+    log "  ethtool <iface>          -- show link speed/duplex"
+    log "  arp -a                   -- show ARP table"
+    log ""
+    log "--- Exit ---"
+    log "  Type 'poweroff' or press Ctrl-a x to exit QEMU"
+    log "  Ctrl-C works to stop running commands (e.g. ping)"
+    log "===================================="
+
+    export HOME=/root
+    export TERM=vt100
+    cd /root
+
+    # Fix terminal for interactive use in QEMU serial console:
+    # - 'stty sane' restores cooked mode so Ctrl-C generates SIGINT
+    # - 'stty intr ^C' ensures Ctrl-C is the interrupt character
+    stty sane 2>/dev/null
+    stty intr ^C 2>/dev/null
+    exec /bin/sh -l
+fi
+
 # Run test suite
 if [ -f /root/test_vf_and_link.sh ]; then
     log "Starting test suite..."
@@ -659,15 +908,18 @@ reboot -f
 INITEOF
 
     # Inject host-provided datapath test settings
-    # Use first TAP device IP (tap_ice0 at 192.168.100.100) as the peer IP
+    # ICE_MP_TEST_PEER_IP is a flag to enable the per-port subnet ping test
+    # (actual IPs are computed per-port: 10.0.N.2 -> 10.0.N.1)
     sed -i \
-        -e "s|__ICE_MP_TEST_PEER_IP__|192.168.100.100|g" \
+        -e "s|__ICE_MP_TEST_PEER_IP__|10.0.0.1|g" \
         -e "s|__ICE_MP_TEST_GUEST_IP__|$GUEST_IP/24|g" \
         -e "s|__ICE_MP_EXPECTED_PORTS__|$QEMU_PORTS|g" \
         -e "s|__ICE_MP_EXPECTED_VFS__|$QEMU_VFS|g" \
         -e "s|__ICE_MP_EXPECTED_VFS_PER_PORT__|$QEMU_VFS_PER_PORT|g" \
         -e "s|__ICE_MP_EXPECTED_PF_DEVICES__|$QEMU_PF_DEVICES|g" \
         -e "s|__ICE_MP_EXPECTED_VFS_PER_PF__|$QEMU_VFS_PER_DEVICE|g" \
+        -e "s|__ICE_MP_PORTS_PER_PF__|$QEMU_PORTS_PER_DEVICE|g" \
+        -e "s|__ICE_MP_INTERACTIVE_MODE__|$INTERACTIVE_MODE|g" \
         "$rootfs_dir/init"
     
     chmod +x "$rootfs_dir/init"
@@ -691,21 +943,31 @@ setup_network() {
     TAP_DEVICES=()
     TAP_IPS=()
     
+    # IP addressing: each PF port N gets its own /24 subnet: 10.0.N.0/24
+    #   Host TAP (tap_iceN):           10.0.N.1
+    #   Guest PF port:                 10.0.N.2
+    #   Guest VFs mapped to port N:    10.0.N.{10 + vf_local_index}
+    # This enables ping from any guest interface to its corresponding host TAP.
+    
     local port
     for ((port=0; port<QEMU_PORTS; port++)); do
         local tap_dev="tap_ice$port"
-        local tap_ip="192.168.100.$((100 + port))"
+        local tap_ip="10.0.$port.1"
         
         TAP_DEVICES+=("$tap_dev")
         TAP_IPS+=("$tap_ip")
         
-        # Skip creation if already exists
+        # Skip creation if already exists (but reconfigure IP)
         if ip link show "$tap_dev" > /dev/null 2>&1; then
             log_warn "TAP device $tap_dev already exists, reusing"
+            # Flush old addresses and re-add the correct one
+            sudo ip addr flush dev "$tap_dev" 2>/dev/null || true
+            sudo ip addr add "$tap_ip/24" dev "$tap_dev" 2>/dev/null || true
+            sudo ip link set "$tap_dev" up 2>/dev/null || true
             continue
         fi
         
-        log_info "Creating TAP device: $tap_dev with IP $tap_ip"
+        log_info "Creating TAP device: $tap_dev with IP $tap_ip/24"
         
         # Create tap device
         if ! sudo ip tuntap add dev "$tap_dev" mode tap 2>/dev/null; then
@@ -715,7 +977,7 @@ setup_network() {
             fi
         fi
         
-        # Configure tap device with unique IP
+        # Configure tap device with per-port subnet IP
         sudo ip addr add "$tap_ip/24" dev "$tap_dev" 2>/dev/null || log_error "Failed to set IP on $tap_dev"
         sudo ip link set "$tap_dev" up 2>/dev/null || log_error "Failed to bring up $tap_dev"
     done
@@ -732,6 +994,7 @@ setup_network() {
     sudo sysctl net.ipv4.ip_forward=1 > /dev/null 2>&1 || true
     
     log_success "Network setup complete (${QEMU_PORTS} TAP devices: ${TAP_DEVICES[*]})"
+    log_info "Host TAP IP scheme: tap_iceN -> 10.0.N.1/24"
 }
 
 cleanup_network() {
@@ -925,12 +1188,24 @@ boot_qemu() {
         "-m" "$QEMU_MEM"
         "-smp" "$QEMU_CPUS"
         "-nographic"
-        "-monitor" "none"
-        "-qmp" "unix:${QEMU_QMP_SOCK},server=on,wait=off"
-        "-serial" "file:$QEMU_LOG"
-        "-append" "root=/dev/ram console=ttyS0"
         "-no-reboot"
     )
+
+    # Interactive mode: serial on stdio for shell access
+    # Test mode: serial to file, monitor disabled, QMP socket for link tests
+    if [ "$INTERACTIVE_MODE" -eq 1 ] 2>/dev/null; then
+        qemu_cmd+=(
+            "-serial" "mon:stdio"
+            "-append" "root=/dev/ram console=ttyS0 quiet"
+        )
+    else
+        qemu_cmd+=(
+            "-monitor" "none"
+            "-qmp" "unix:${QEMU_QMP_SOCK},server=on,wait=off"
+            "-serial" "file:$QEMU_LOG"
+            "-append" "root=/dev/ram console=ttyS0"
+        )
+    fi
 
     local port
     for ((port=0; port<QEMU_PORTS; port++)); do
@@ -980,7 +1255,17 @@ boot_qemu() {
     log_info "QEMU command:"
     log_info "${qemu_cmd[*]}"
     
-    # Launch QEMU in background (output goes directly to serial file)
+    # Interactive mode: run QEMU in foreground so user gets direct shell access
+    if [ "$INTERACTIVE_MODE" -eq 1 ] 2>/dev/null; then
+        log_info "Launching QEMU in interactive mode (serial on stdio)..."
+        log_info "Guest shell will be available after PF/VF setup completes."
+        log_info "Press Ctrl-a x to exit QEMU."
+        "${qemu_cmd[@]}" 2>"$QEMU_STDERR_LOG"
+        log_info "QEMU exited."
+        return 0
+    fi
+
+    # Non-interactive: launch QEMU in background (output goes directly to serial file)
     "${qemu_cmd[@]}" 2>"$QEMU_STDERR_LOG" &
     local qemu_pid=$!
     echo "$qemu_pid" > "$QEMU_PID_FILE"
@@ -1095,6 +1380,10 @@ main() {
                 SKIP_BUILD=1
                 shift
                 ;;
+            --skip-linux-build)
+                SKIP_LINUX_BUILD=1
+                shift
+                ;;
             --skip-qemu-build)
                 SKIP_QEMU_BUILD=1
                 shift
@@ -1105,6 +1394,10 @@ main() {
                 ;;
             --keep-vm)
                 KEEP_VM=1
+                shift
+                ;;
+            --interactive)
+                INTERACTIVE_MODE=1
                 shift
                 ;;
             --clean)
@@ -1190,10 +1483,18 @@ main() {
         }
         
         # Build kernel
-        build_kernel || {
-            log_error "Failed to build kernel"
-            exit 1
-        }
+        if [ $SKIP_LINUX_BUILD -eq 0 ]; then
+            build_kernel || {
+                log_error "Failed to build kernel"
+                exit 1
+            }
+        else
+            log_info "Skipping Linux kernel build (--skip-linux-build)"
+            if [ ! -f "$KERNEL_PATH" ]; then
+                log_error "Kernel not found: $KERNEL_PATH"
+                exit 1
+            fi
+        fi
         
         if [ $KERNEL_ONLY -eq 1 ]; then
             log_success "Build complete. To run tests, use --skip-build"
@@ -1219,7 +1520,15 @@ main() {
     # Setup network
     setup_network
     
-    # Boot and test
+    # Boot and test (or interactive)
+    if [ "$INTERACTIVE_MODE" -eq 1 ] 2>/dev/null; then
+        boot_qemu
+        cleanup_network
+        log_info "QEMU stderr log: $QEMU_STDERR_LOG"
+        log_success "Interactive session ended"
+        exit 0
+    fi
+
     if [ $SKIP_TEST -eq 0 ]; then
         boot_qemu
     fi

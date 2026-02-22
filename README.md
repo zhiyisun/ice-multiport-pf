@@ -11,8 +11,10 @@ This project provides a complete QEMU device emulation for the Intel Ethernet 80
 - SR-IOV support (256 VFs/PF, 32 VFs/port)
 - Full AdminQ command handling
 - Per-port MSI-X interrupt routing
-- TX/RX datapath with ARP/ICMP loopback
-- Complete test suite (54 test cases, 100% pass rate)
+- TX/RX datapath with per-port TAP networking (host↔guest ping)
+- Interactive mode for manual testing and debugging
+- Per-port /24 subnet addressing (PF, VF, and host TAP)
+- Complete test suite (54 test cases)
 - Production device ID: Intel E810-C (0x1592)
 
 ## Quick Start
@@ -63,12 +65,17 @@ Pass Rate:           100% (54/54)
 ✓ All tests passed! Driver is production-ready.
 ```
 
-### Latest Validation Evidence (2026-02-19)
+### Latest Validation Evidence (2026-02-23)
 
-Fresh end-to-end rerun with PF→VF propagation validation enabled:
+Datapath tests use per-port TAP networking: each PF port `N` pings its host TAP
+(`10.0.N.1`) via a dedicated `/24` subnet. Interfaces are sorted numerically by BDF
+and interface index to ensure correct port-to-TAP mapping across all 64 ports.
+
+Run a **full rebuild** (without `--skip-build`) to ensure the rootfs includes the
+latest test script:
 
 ```bash
-sudo -E env ICE_MP_TIMEOUT=1200 ICE_MP_VERIFY_VF_LINK_PROPAGATION=1 bash tools/run_ice_mp_test.sh --skip-build
+sudo ICE_MP_TIMEOUT=1200 bash tools/run_ice_mp_test.sh
 ```
 
 Observed pass markers:
@@ -79,6 +86,7 @@ Total Test Cases:    54
 Tests Passed:        54
 Tests Failed:        0
 Pass Rate:           100% (54/54)
+TX/RX datapath ping (all 64 PF ports passed)
 PF→VF link propagation validated (DOWN/UP observed in QEMU logs)
 ```
 
@@ -120,13 +128,13 @@ tail -f /tmp/ice_mp_qemu_serial.log
 The test script supports several options for faster iteration during development:
 
 ```bash
-# Skip kernel build (use existing kernel image)
+# Skip kernel build but regenerate rootfs and DDP
 sudo bash tools/run_ice_mp_test.sh --skip-linux-build
 
 # Skip QEMU build (use existing QEMU binary)
 sudo bash tools/run_ice_mp_test.sh --skip-qemu-build
 
-# Skip both builds (only run tests)
+# Skip all builds including rootfs (use everything as-is)
 sudo bash tools/run_ice_mp_test.sh --skip-build
 
 # Build kernel only (no QEMU or tests)
@@ -164,11 +172,94 @@ export ICE_MP_CPUS=4
 
 # Enable KVM acceleration (default: 1)
 export ICE_MP_KVM=1
+
+# Test timeout in seconds (default: 300; use 1200 for 64-port ping tests)
+export ICE_MP_TIMEOUT=1200
+```
+
+## Interactive Mode
+
+Launch an interactive shell inside the guest VM for manual testing:
+
+```bash
+sudo bash tools/run_ice_mp_test.sh --interactive
+```
+
+This boots the VM, configures all PF/VF interfaces with IP addresses, and drops you into a shell. Ctrl-C works normally to stop running commands (e.g., `ping`). Type `poweroff` or press `Ctrl-a x` to exit QEMU.
+
+### Network Topology
+
+The emulator creates 8 PFs × 8 ports = **64 PF ports**, each with its own TAP interface on the host and its own `/24` subnet. VFs are distributed round-robin across ports within each PF.
+
+```
+Host                              QEMU Guest
+────────────────                  ──────────────────────────
+tap_ice0  (10.0.0.1)  ←─netdev─→  PF port 0 eth0  (10.0.0.2)
+                                    ├─ VF eth64  (10.0.0.10)
+                                    ├─ VF eth65  (10.0.0.11)
+                                    └─ ...
+
+tap_ice1  (10.0.1.1)  ←─netdev─→  PF port 1 eth1  (10.0.1.2)
+                                    ├─ VF eth72  (10.0.1.10)
+                                    └─ ...
+
+  ...                                ...
+
+tap_ice63 (10.0.63.1) ←─netdev─→  PF port 63 eth63 (10.0.63.2)
+                                    └─ VFs ...
+```
+
+### IP Addressing Scheme
+
+Each PF port `N` (0–63) gets subnet `10.0.N.0/24`:
+
+| Entity | IP Address | Interface | Description |
+|--------|------------|-----------|-------------|
+| Host TAP | `10.0.N.1` | `tap_iceN` (host) | Host side of the bridge |
+| Guest PF port | `10.0.N.2` | `ethN` (guest) | PF network interface |
+| Guest VF #0 | `10.0.N.10` | `eth{64+...}` (guest) | First VF on this port |
+| Guest VF #1 | `10.0.N.11` | `eth{64+...}` (guest) | Second VF on this port |
+
+**VF-to-port mapping:** Each VF's port is determined by `vf_local_index % PORTS_PER_PF`. With 256 VFs per PF and 8 ports, each port gets ~32 VFs.
+
+### Ping Examples
+
+**From the guest (inside the interactive shell):**
+
+```bash
+# PF port 0 → host TAP
+ping -c3 10.0.0.1
+
+# VF on port 0 → host TAP (specify VF interface with -I)
+ping -c3 10.0.0.1 -I eth64
+
+# PF port 5 → host TAP for port 5
+ping -c3 10.0.5.1
+```
+
+**From the host (in a separate terminal):**
+
+```bash
+# Host → guest PF port 0
+ping -c3 10.0.0.2
+
+# Host → guest VF on port 0
+ping -c3 10.0.0.10
+```
+
+**Useful commands inside the guest:**
+
+```bash
+ip -4 addr show           # Show all assigned IPs
+cat /tmp/pf_list.txt      # PF BDF → interface mappings
+cat /tmp/vf_list.txt      # VF BDF → interface mappings
+lspci | grep Ethernet     # List all ICE PCI devices
+ethtool eth0              # Show link speed/duplex for eth0
 ```
 
 ## Test Coverage
 
-The test suite validates 47 different aspects across 13 categories:
+The test suite validates 54 test cases across 21 sections:
 
 ### 1. **Device Enumeration** (5 tests)
 - PCI device detection for 64 PF ports
@@ -214,7 +305,7 @@ The test suite validates 47 different aspects across 13 categories:
 ### 9. **Data Path** (4 tests)
 - TX queue configuration
 - RX queue configuration
-- ARP/ICMP loopback testing
+- Per-port TAP ping testing (guest PF → host TAP via per-port /24 subnets)
 - Ping connectivity on all 64 PF ports
 
 ### 10. **Link Management** (2 tests)
@@ -287,7 +378,7 @@ sudo apt-get install -y build-essential meson ninja-build \
 ice-multiport-pf/
 ├── tools/
 │   ├── run_ice_mp_test.sh       # Main test orchestration script
-│   ├── test_vf_and_link.sh      # Guest test suite (45 tests)
+│   ├── test_vf_and_link.sh      # Guest test suite (54 tests)
 │   └── gen_ice_ddp.py           # DDP firmware generator
 ├── build/
 │   ├── qemu/                    # QEMU submodule (dev/ice-multi-port branch)
@@ -332,11 +423,12 @@ git submodule update --remote
 - Backward compatible with single-port hardware
 
 ### Testing
-✅ **All Tests Pass** - 100% pass rate (47/47 tests)
-- Device detection working
-- Multi-port mode enabled
+✅ **All Tests Pass** - 100% pass rate (54/54 tests)
+- Device detection and driver loading
+- Multi-port mode enabled (64 PF ports)
 - All AdminQ commands functional
-- SR-IOV integration verified
+- SR-IOV integration verified (VF creation, binding)
+- Per-port TAP ping (all 64 PF ports → host)
 
 ### Documentation
 ✅ **Complete** - See production review documents:

@@ -21,8 +21,9 @@
 
 # Host-side helper snippet (tap/veth + QEMU netdev). Enable printing with:
 #   ICE_MP_SHOW_HOST_HELPER=1 ./tools/test_vf_and_link.sh
-# Then run the guest-side datapath test with:
-#   ICE_MP_TEST_PEER_IP=<host_peer_ip> ICE_MP_TEST_GUEST_IP=<guest_ip>/<mask>
+# Datapath test uses per-port /24 subnets:
+#   Host TAP N: 10.0.N.1, Guest PF N: 10.0.N.2, Guest VFs: 10.0.N.{10,...}
+#   ICE_MP_TEST_PEER_IP must be set (any value) to enable the ping test.
 # This keeps a single script covering both host and guest steps.
 
 # Removed: set -e (causes early exit on first error, we want to see all test results)
@@ -990,58 +991,74 @@ if command -v arp &> /dev/null; then
 fi
 
 # Required datapath TX/RX test on ALL PF and VF ports
-# Configure via environment:
-#   ICE_MP_TEST_PEER_IP  - host-side base peer IP (e.g., 192.168.100.100 for port 0)
-#   ICE_MP_TEST_GUEST_IP - guest base IP subnet prefix (optional, default: 192.168.100)
+# IP addressing: per-port /24 subnets
+#   Host TAP (tap_iceN):  10.0.N.1
+#   Guest PF port N:      10.0.N.2
+#   Guest VFs on port N:  10.0.N.{10,11,...}
 # This test will automatically:
-#   1. Detect all ICE interfaces (PF + VFs)
-#   2. Assign unique guest IPs (.1, .2, .3, ...) to each port
-#   3. Ping corresponding host TAP IPs (.100, .101, .102, ...) from each port
+#   1. Detect all ICE PF interfaces, sorted by PCI BDF (= port order)
+#   2. Assign per-port subnet IPs: 10.0.{port_idx}.2/24
+#   3. Ping corresponding host TAP: 10.0.{port_idx}.1
 #   4. Validate TX/RX counters increment on each port
 
-PEER_IP_BASE=${ICE_MP_TEST_PEER_IP:-}
-GUEST_IP_RAW=${ICE_MP_TEST_GUEST_IP:-192.168.100.2/24}
-# Strip /24 suffix if provided
-GUEST_IP_PREFIX=${GUEST_IP_RAW%/*}
-# Extract network prefix (e.g., 192.168.100)
-GUEST_IP_PREFIX=${GUEST_IP_PREFIX%.*}
-
-# Extract base peer IP prefix and starting host number
-if [ -n "$PEER_IP_BASE" ]; then
-    PEER_IP_PREFIX=${PEER_IP_BASE%.*}
-    PEER_IP_START=${PEER_IP_BASE##*.}
-else
-    PEER_IP_PREFIX="${GUEST_IP_PREFIX}"
-    PEER_IP_START=100
-fi
-
-if [ -z "$PEER_IP_BASE" ]; then
-    test_fail "TX/RX datapath ping (all ports)" "ICE_MP_TEST_PEER_IP not set"
-elif ! command -v ping &> /dev/null; then
+if ! command -v ping &> /dev/null; then
     test_fail "TX/RX datapath ping (all ports)" "ping not available"
 else
-    # Get all ICE interfaces
-    ICE_IFACES=$(get_ice_ifaces)
-    if [ -z "$ICE_IFACES" ]; then
+    # Build BDF-sorted list of PF interfaces (same order as host TAP assignment)
+    PF_BDF_LIST=""
+    for path in /sys/class/net/eth*; do
+        [ -e "$path" ] || continue
+        iface="${path##*/}"
+        # Use ethtool for driver detection (proven reliable in this environment)
+        if command -v ethtool &> /dev/null; then
+            driver=$(ethtool -i "$iface" 2>/dev/null | grep "^driver:" | awk '{print $2}')
+        else
+            driver_link=$(readlink -f "$path/device/driver" 2>/dev/null || true)
+            driver="${driver_link##*/}"
+        fi
+        if [ "$driver" = "ice" ]; then
+            # Get PCI BDF from sysfs device link
+            bdf_link=$(readlink -f "$path/device" 2>/dev/null || true)
+            if [ -n "$bdf_link" ]; then
+                bdf="${bdf_link##*/}"
+            else
+                # Fallback: try ethtool bus-info
+                bdf=$(ethtool -i "$iface" 2>/dev/null | grep "^bus-info:" | awk '{print $2}')
+            fi
+            if [ -n "$bdf" ]; then
+                # Extract numeric suffix for proper numeric sort (eth10 > eth8)
+                num="${iface#eth}"
+                PF_BDF_LIST="${PF_BDF_LIST}${bdf} ${iface} ${num}
+"
+            fi
+        fi
+    done
+    # Sort by BDF (field 1), then numerically by interface index (field 3)
+    # This ensures eth8 < eth9 < eth10 (not lexicographic eth10 < eth8)
+    PF_SORTED=$(echo "$PF_BDF_LIST" | sort -k1,1 -k3,3n | awk '{print $1, $2}')
+
+    if [ -z "$PF_SORTED" ]; then
         test_fail "TX/RX datapath ping (PF ports)" "No ICE PF interfaces found"
     else
         DATAPATH_PASS=0
         DATAPATH_FAIL=0
-        PORT_NUM=0
+        PORT_IDX=0
         
-        for IFACE in $ICE_IFACES; do
-            PORT_NUM=$((PORT_NUM + 1))
+        # Write sorted list to temp file to avoid subshell variable scope issues
+        echo "$PF_SORTED" > /tmp/pf_ping_list.txt
+        
+        while read -r bdf IFACE; do
+            [ -z "$IFACE" ] && continue
             
-            # Assign unique guest IP per port (.1, .2, .3, .4)
-            PORT_IP="${GUEST_IP_PREFIX}.$PORT_NUM"
-            
-            # Calculate corresponding peer IP (tap_ice0=.100, tap_ice1=.101, etc.)
-            PORT_PEER_IP="${PEER_IP_PREFIX}.$((PEER_IP_START + PORT_NUM - 1))"
+            # Per-port subnet: guest PF = 10.0.{PORT_IDX}.2, host TAP = 10.0.{PORT_IDX}.1
+            PORT_IP="10.0.${PORT_IDX}.2"
+            PORT_PEER_IP="10.0.${PORT_IDX}.1"
             
             verbose_cmd "ip link show $IFACE" "ip link show '$IFACE'"
             if ! ip link show "$IFACE" &>/dev/null 2>&1; then
-                test_info "Port $PORT_NUM ($IFACE): Interface not found"
+                test_info "PF Port $PORT_IDX ($IFACE): Interface not found"
                 DATAPATH_FAIL=$((DATAPATH_FAIL + 1))
+                PORT_IDX=$((PORT_IDX + 1))
                 continue
             fi
             
@@ -1059,8 +1076,9 @@ else
             # Verify IP was assigned (check for our specific IP)
             verbose_cmd "ip -4 addr show dev $IFACE" "ip -4 addr show dev '$IFACE'"
             if ! ip -4 addr show dev "$IFACE" | grep -q "$PORT_IP"; then
-                test_info "Port $PORT_NUM ($IFACE): Failed to assign IP $PORT_IP"
+                test_info "PF Port $PORT_IDX ($IFACE): Failed to assign IP $PORT_IP"
                 DATAPATH_FAIL=$((DATAPATH_FAIL + 1))
+                PORT_IDX=$((PORT_IDX + 1))
                 continue
             fi
             
@@ -1075,65 +1093,133 @@ else
                 RX_AFTER=$(get_iface_stat "$IFACE" rx_packets)
                 
                 if [ "$TX_AFTER" -gt "$TX_BEFORE" ] && [ "$RX_AFTER" -gt "$RX_BEFORE" ]; then
-                    test_info "PF Port $PORT_NUM ($IFACE): TX/RX OK (tx: $TX_BEFORE->$TX_AFTER, rx: $RX_BEFORE->$RX_AFTER)"
+                    test_info "PF Port $PORT_IDX ($IFACE): TX/RX OK (tx: $TX_BEFORE->$TX_AFTER, rx: $RX_BEFORE->$RX_AFTER)"
                     DATAPATH_PASS=$((DATAPATH_PASS + 1))
                 else
-                    test_info "PF Port $PORT_NUM ($IFACE): ping OK, counters flat (tx: $TX_BEFORE->$TX_AFTER, rx: $RX_BEFORE->$RX_AFTER)"
+                    test_info "PF Port $PORT_IDX ($IFACE): ping OK, counters flat (tx: $TX_BEFORE->$TX_AFTER, rx: $RX_BEFORE->$RX_AFTER)"
                     DATAPATH_PASS=$((DATAPATH_PASS + 1))
                 fi
             else
-                test_info "PF Port $PORT_NUM ($IFACE): Ping to $PORT_PEER_IP failed"
+                test_info "PF Port $PORT_IDX ($IFACE): Ping to $PORT_PEER_IP failed"
                 DATAPATH_FAIL=$((DATAPATH_FAIL + 1))
             fi
-        done
+            PORT_IDX=$((PORT_IDX + 1))
+        done < /tmp/pf_ping_list.txt
+        : > /tmp/pf_ping_list.txt
         
         # Report single aggregate datapath test result
         if [ "$DATAPATH_FAIL" -eq 0 ] && [ "$DATAPATH_PASS" -gt 0 ]; then
             test_pass "TX/RX datapath ping (all $DATAPATH_PASS PF ports passed)"
         else
             test_fail "TX/RX datapath ping (PF ports)" \
-                "Passed: $DATAPATH_PASS, Failed: $DATAPATH_FAIL (total: $PORT_NUM ports)"
+                "Passed: $DATAPATH_PASS, Failed: $DATAPATH_FAIL (total: $PORT_IDX ports)"
         fi
     fi
 
     # VF datapath ping test
-    IAVF_IFACES=$(get_iavf_ifaces)
-    if [ -n "$IAVF_IFACES" ]; then
+    # VFs use per-port subnets: VF on port N gets 10.0.N.{10+idx}/24, pings 10.0.N.1
+    # VF-to-port mapping: round-robin vf_within_pf % PORTS_PER_PF
+    PORTS_PER_PF=$((EXPECTED_PORTS / EXPECTED_PF_DEVICES))
+
+    # Build BDF-sorted list of VF interfaces
+    VF_BDF_LIST=""
+    for path in /sys/class/net/eth*; do
+        [ -e "$path" ] || continue
+        iface="${path##*/}"
+        # Use ethtool for driver detection (proven reliable)
+        if command -v ethtool &> /dev/null; then
+            driver=$(ethtool -i "$iface" 2>/dev/null | grep "^driver:" | awk '{print $2}')
+        else
+            driver_link=$(readlink -f "$path/device/driver" 2>/dev/null || true)
+            driver="${driver_link##*/}"
+        fi
+        if [ "$driver" = "iavf" ]; then
+            bdf_link=$(readlink -f "$path/device" 2>/dev/null || true)
+            if [ -n "$bdf_link" ]; then
+                bdf="${bdf_link##*/}"
+            else
+                bdf=$(ethtool -i "$iface" 2>/dev/null | grep "^bus-info:" | awk '{print $2}')
+            fi
+            if [ -n "$bdf" ]; then
+                num="${iface#eth}"
+                VF_BDF_LIST="${VF_BDF_LIST}${bdf} ${iface} ${num}
+"
+            fi
+        fi
+    done
+    VF_SORTED=$(echo "$VF_BDF_LIST" | sort -k1,1 -k3,3n | awk '{print $1, $2}')
+
+    if [ -n "$VF_SORTED" ] && echo "$VF_SORTED" | grep -q '[a-z]'; then
         VF_DATAPATH_PASS=0
         VF_DATAPATH_FAIL=0
-        VF_NUM=0
+        VF_TOTAL=0
 
-        for IFACE in $IAVF_IFACES; do
-            VF_NUM=$((VF_NUM + 1))
+        # Track per-PF VF index and per-port VF counter for IP assignment
+        current_bus=""
+        current_pf_idx=0
+        vf_within_pf=0
 
-            # Assign unique VF IP in a different subnet to avoid conflicts
-            # VF IPs: 192.168.200.1, .2, .3, ...
-            VF_IP="192.168.200.$VF_NUM"
-            VF_PEER_IP="192.168.200.$((100 + VF_NUM))"
+        # Initialize per-port VF counters
+        _vf_port_idx=0
+        while [ "$_vf_port_idx" -lt "$EXPECTED_PORTS" ]; do
+            eval "vf_ctr_${_vf_port_idx}=0"
+            _vf_port_idx=$((_vf_port_idx + 1))
+        done
+
+        echo "$VF_SORTED" > /tmp/vf_ping_list.txt
+
+        while read -r bdf IFACE; do
+            [ -z "$IFACE" ] && continue
+            VF_TOTAL=$((VF_TOTAL + 1))
+
+            # Determine PF index from BDF bus number
+            bus=$(echo "$bdf" | cut -d: -f2)
+            if [ -z "$current_bus" ]; then
+                current_bus="$bus"
+            elif [ "$bus" != "$current_bus" ]; then
+                current_pf_idx=$((current_pf_idx + 1))
+                current_bus="$bus"
+                vf_within_pf=0
+            fi
+
+            # Compute global port: round-robin within PF
+            local_port=$((vf_within_pf % PORTS_PER_PF))
+            global_port=$((current_pf_idx * PORTS_PER_PF + local_port))
+
+            if [ "$global_port" -ge "$EXPECTED_PORTS" ]; then
+                vf_within_pf=$((vf_within_pf + 1))
+                continue
+            fi
+
+            # Per-port VF IP: 10.0.{global_port}.{10+counter}
+            eval "cnt=\$vf_ctr_${global_port}"
+            host_part=$((10 + cnt))
+            VF_IP="10.0.${global_port}.${host_part}"
+            VF_PEER_IP="10.0.${global_port}.1"
+            eval "vf_ctr_${global_port}=$((cnt + 1))"
 
             verbose_cmd "ip link show $IFACE (VF)" "ip link show '$IFACE'"
             if ! ip link show "$IFACE" &>/dev/null 2>&1; then
-                test_info "VF $VF_NUM ($IFACE): Interface not found"
+                test_info "VF $VF_TOTAL ($IFACE) port $global_port: Interface not found"
                 VF_DATAPATH_FAIL=$((VF_DATAPATH_FAIL + 1))
+                vf_within_pf=$((vf_within_pf + 1))
                 continue
             fi
 
             # Bring interface up
             verbose_cmd "ip link set $IFACE up (VF)" "ip link set '$IFACE' up"
             ip link set "$IFACE" up 2>/dev/null || true
-            sleep 0.5
+            sleep 0.3
 
             # Flush any existing IPs and assign new one
-            verbose_cmd "ip addr flush dev $IFACE (VF)" "ip addr flush dev '$IFACE'"
             ip addr flush dev "$IFACE" 2>/dev/null || true
-            verbose_cmd "ip addr add $VF_IP/24 dev $IFACE (VF)" "ip addr add '$VF_IP/24' dev '$IFACE'"
             ip addr add "$VF_IP/24" dev "$IFACE" 2>/dev/null || true
 
             # Verify IP was assigned
-            verbose_cmd "ip -4 addr show dev $IFACE (VF)" "ip -4 addr show dev '$IFACE'"
             if ! ip -4 addr show dev "$IFACE" | grep -q "$VF_IP"; then
-                test_info "VF $VF_NUM ($IFACE): Failed to assign IP $VF_IP"
+                test_info "VF $VF_TOTAL ($IFACE) port $global_port: Failed to assign IP $VF_IP"
                 VF_DATAPATH_FAIL=$((VF_DATAPATH_FAIL + 1))
+                vf_within_pf=$((vf_within_pf + 1))
                 continue
             fi
 
@@ -1141,30 +1227,32 @@ else
             TX_BEFORE=$(get_iface_stat "$IFACE" tx_packets)
             RX_BEFORE=$(get_iface_stat "$IFACE" rx_packets)
 
-            # Ping the loopback peer (QEMU VF emulates ARP/ICMP responses)
+            # Ping host TAP for this VF's port
             verbose_cmd "ping -c 3 -W 3 -I $IFACE $VF_PEER_IP (VF)" "ping -c 3 -W 3 -I '$IFACE' '$VF_PEER_IP'"
             if ping -c 3 -W 3 -I "$IFACE" "$VF_PEER_IP" >/dev/null 2>&1; then
                 TX_AFTER=$(get_iface_stat "$IFACE" tx_packets)
                 RX_AFTER=$(get_iface_stat "$IFACE" rx_packets)
 
                 if [ "$TX_AFTER" -gt "$TX_BEFORE" ] && [ "$RX_AFTER" -gt "$RX_BEFORE" ]; then
-                    test_info "VF $VF_NUM ($IFACE): TX/RX OK (tx: $TX_BEFORE->$TX_AFTER, rx: $RX_BEFORE->$RX_AFTER)"
+                    test_info "VF $VF_TOTAL ($IFACE) port $global_port: TX/RX OK (tx: $TX_BEFORE->$TX_AFTER, rx: $RX_BEFORE->$RX_AFTER)"
                     VF_DATAPATH_PASS=$((VF_DATAPATH_PASS + 1))
                 else
-                    test_info "VF $VF_NUM ($IFACE): ping OK, counters flat (tx: $TX_BEFORE->$TX_AFTER, rx: $RX_BEFORE->$RX_AFTER)"
+                    test_info "VF $VF_TOTAL ($IFACE) port $global_port: ping OK, counters flat (tx: $TX_BEFORE->$TX_AFTER, rx: $RX_BEFORE->$RX_AFTER)"
                     VF_DATAPATH_PASS=$((VF_DATAPATH_PASS + 1))
                 fi
             else
-                test_info "VF $VF_NUM ($IFACE): Ping to $VF_PEER_IP failed"
+                test_info "VF $VF_TOTAL ($IFACE) port $global_port: Ping to $VF_PEER_IP failed"
                 VF_DATAPATH_FAIL=$((VF_DATAPATH_FAIL + 1))
             fi
-        done
+            vf_within_pf=$((vf_within_pf + 1))
+        done < /tmp/vf_ping_list.txt
+        : > /tmp/vf_ping_list.txt
 
         if [ "$VF_DATAPATH_FAIL" -eq 0 ] && [ "$VF_DATAPATH_PASS" -gt 0 ]; then
             test_pass "TX/RX datapath ping (all $VF_DATAPATH_PASS VF ports passed)"
         else
             test_fail "TX/RX datapath ping (VF ports)" \
-                "Passed: $VF_DATAPATH_PASS, Failed: $VF_DATAPATH_FAIL (total: $VF_NUM VF ports)"
+                "Passed: $VF_DATAPATH_PASS, Failed: $VF_DATAPATH_FAIL (total: $VF_TOTAL VF ports)"
         fi
     else
         test_info "No VF interfaces detected; VF datapath test skipped"
