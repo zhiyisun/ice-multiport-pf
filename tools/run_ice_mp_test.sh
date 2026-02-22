@@ -43,7 +43,7 @@
 #   ICE_MP_NET_TAP     TAP device name (default: tap0)
 #   ICE_MP_NET_IP      TAP device IP (default: 192.168.100.1)
 #   ICE_MP_GUEST_IP    Guest IP (default: 192.168.100.2)
-#   ICE_MP_TIMEOUT     Test timeout in seconds (default: 300)
+#   ICE_MP_TIMEOUT     Test timeout in seconds (default: auto; scales for topology size)
 #
 ################################################################################
 
@@ -94,7 +94,17 @@ QEMU_VFS=$((QEMU_PF_DEVICES * QEMU_VFS_PER_DEVICE))
 TAP_DEVICE="${ICE_MP_NET_TAP:-tap0}"
 TAP_IP="${ICE_MP_NET_IP:-192.168.100.1}"
 GUEST_IP="${ICE_MP_GUEST_IP:-192.168.100.2}"
-TEST_TIMEOUT="${ICE_MP_TIMEOUT:-300}"
+TEST_TIMEOUT="${ICE_MP_TIMEOUT:-}"
+
+# Auto-scale timeout for larger topologies when user does not override ICE_MP_TIMEOUT.
+# 64-port per-port ping validation can exceed 300s.
+if [ -z "$TEST_TIMEOUT" ]; then
+    auto_timeout=$((300 + QEMU_PORTS * 8))
+    if [ "$auto_timeout" -gt 1200 ]; then
+        auto_timeout=1200
+    fi
+    TEST_TIMEOUT="$auto_timeout"
+fi
 
 # Logging
 QEMU_LOG="/tmp/ice_mp_qemu_serial.log"
@@ -106,6 +116,7 @@ VERIFY_VF_LINK_PROPAGATION="${ICE_MP_VERIFY_VF_LINK_PROPAGATION:-1}"
 
 LINK_PROP_TEST_TRIGGERED=0
 LINK_PROP_TEST_PORT=0
+TEST_TIMED_OUT=0
 
 # Color codes
 RED='\033[0;31m'
@@ -1288,6 +1299,7 @@ boot_qemu() {
     local elapsed=0
     local propagation_attempted=0
     local propagation_gate_seen=0
+    TEST_TIMED_OUT=0
     while [ $elapsed -lt "$TEST_TIMEOUT" ]; do
         if [ "$VERIFY_VF_LINK_PROPAGATION" -eq 1 ] 2>/dev/null && [ $propagation_attempted -eq 0 ]; then
             if [ -f "$QEMU_LOG" ] && grep -q "Section 3: SR-IOV Configuration" "$QEMU_LOG"; then
@@ -1318,6 +1330,7 @@ boot_qemu() {
     # If QEMU is still running after timeout, kill it
     if kill -0 "$qemu_pid" 2>/dev/null; then
         log_warn "Test execution timed out (${TEST_TIMEOUT}s), terminating QEMU"
+        TEST_TIMED_OUT=1
         kill -9 "$qemu_pid" 2>/dev/null || true
         wait "$qemu_pid" 2>/dev/null || true
     fi
@@ -1349,7 +1362,17 @@ collect_test_results() {
         log_warn "Some tests may have failed. Check output above."
         guest_result=1
     else
-        log_error "Test results not found in QEMU log - tests may not have completed"
+        if [ "$TEST_TIMED_OUT" -eq 1 ]; then
+            last_section=$(grep -o "Section [0-9][0-9]*:.*" "$QEMU_LOG" | tail -1 || true)
+            if [ -n "$last_section" ]; then
+                log_error "Test summary not found because run timed out at ${TEST_TIMEOUT}s (last marker: $last_section)"
+            else
+                log_error "Test summary not found because run timed out at ${TEST_TIMEOUT}s before section markers"
+            fi
+            log_info "Tip: set ICE_MP_TIMEOUT=1200 for 64-port runs"
+        else
+            log_error "Test results not found in QEMU log - tests may not have completed"
+        fi
         guest_result=1
     fi
 

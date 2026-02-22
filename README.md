@@ -173,7 +173,7 @@ export ICE_MP_CPUS=4
 # Enable KVM acceleration (default: 1)
 export ICE_MP_KVM=1
 
-# Test timeout in seconds (default: 300; use 1200 for 64-port ping tests)
+# Test timeout in seconds (default: auto-scaling; set explicitly for long runs)
 export ICE_MP_TIMEOUT=1200
 ```
 
